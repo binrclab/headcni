@@ -30,6 +30,7 @@ type NetConf struct {
 	// Tailscale 配置
 	HeadscaleURL    string `json:"headscale_url"`
 	TailscaleSocket string `json:"tailscale_socket,omitempty"`
+	AuthKey         string `json:"auth_key,omitempty"` // 支持从配置文件读取（不推荐）
 
 	// IPAM 配置
 	IPAM struct {
@@ -41,8 +42,13 @@ type NetConf struct {
 	PodCIDR     string `json:"pod_cidr"`
 	ServiceCIDR string `json:"service_cidr,omitempty"`
 
-	// DNS 配置
-	DNS types.DNS `json:"dns,omitempty"`
+	// MagicDNS 配置
+	MagicDNS struct {
+		Enable        bool     `json:"enable"`
+		BaseDomain    string   `json:"base_domain,omitempty"`
+		Nameservers   []string `json:"nameservers,omitempty"`
+		SearchDomains []string `json:"search_domains,omitempty"`
+	} `json:"magic_dns,omitempty"`
 
 	// 高级选项
 	MTU                 int  `json:"mtu,omitempty"`
@@ -80,22 +86,38 @@ func cmdAdd(args *skel.CmdArgs) error {
 		return fmt.Errorf("failed to parse pod info: %v", err)
 	}
 
-	// 分配 IP 地址
-	allocation, err := plugin.ipamManager.AllocateIP(
-		ctx,
-		podInfo.Namespace,
-		podInfo.Name,
-		args.ContainerID,
-	)
-	if err != nil {
-		return fmt.Errorf("IPAM allocation failed: %v", err)
+	// 根据 IPAM 类型分配 IP 地址
+	var allocation *ipam.IPAllocation
+
+	switch plugin.config.IPAM.Type {
+	case "headcni-ipam":
+		// 使用自定义 IPAM
+		allocation, err = plugin.ipamManager.AllocateIP(
+			ctx,
+			podInfo.Namespace,
+			podInfo.Name,
+			args.ContainerID,
+		)
+		if err != nil {
+			return fmt.Errorf("IPAM allocation failed: %v", err)
+		}
+
+	case "host-local":
+		// 使用 host-local IPAM
+		allocation, err = plugin.allocateWithHostLocal(podInfo, args.ContainerID)
+		if err != nil {
+			return fmt.Errorf("host-local allocation failed: %v", err)
+		}
+
+	default:
+		return fmt.Errorf("unsupported IPAM type: %s (supported: host-local, headcni-ipam)", plugin.config.IPAM.Type)
 	}
 
 	// 配置 Pod 网络
 	result, err := plugin.setupPodNetwork(args, allocation)
 	if err != nil {
 		// 出错时清理分配的 IP
-		plugin.ipamManager.ReleaseIP(ctx, podInfo.Namespace, podInfo.Name)
+		plugin.releaseIP(podInfo, args.ContainerID)
 		return fmt.Errorf("failed to setup pod network: %v", err)
 	}
 
@@ -148,8 +170,12 @@ func (p *CNIPlugin) setupPodNetwork(args *skel.CmdArgs, allocation *ipam.IPAlloc
 		}
 
 		// 可选：配置 DNS
-		if p.config.DNS.Nameservers != nil {
-			result.DNS = p.config.DNS
+		if p.config.MagicDNS.Enable {
+			result.DNS = types.DNS{
+				Nameservers: p.config.MagicDNS.Nameservers,
+				Search:      p.config.MagicDNS.SearchDomains,
+				Domain:      p.config.MagicDNS.BaseDomain,
+			}
 		}
 
 		return nil
@@ -309,9 +335,6 @@ func cmdDel(args *skel.CmdArgs) error {
 
 	klog.Infof("CNI DEL called for container %s", args.ContainerID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	// 解析 Pod 信息
 	podInfo, err := parsePodInfo(args.Args)
 	if err != nil {
@@ -319,9 +342,7 @@ func cmdDel(args *skel.CmdArgs) error {
 		// 删除时解析失败不应阻塞清理过程
 	} else {
 		// 释放 IP 地址
-		if err := plugin.ipamManager.ReleaseIP(ctx, podInfo.Namespace, podInfo.Name); err != nil {
-			klog.Warningf("Failed to release IP: %v", err)
-		}
+		plugin.releaseIP(podInfo, args.ContainerID)
 	}
 
 	// 清理网络配置（veth 接口会在容器删除时自动清理）
@@ -478,7 +499,36 @@ func loadConfig(stdinData []byte, cniArgs string) (*CNIPlugin, error) {
 
 	// 设置默认值
 	if conf.MTU == 0 {
-		conf.MTU = 1420 // 考虑 Tailscale 封装开销
+		conf.MTU = 1280 // 考虑 Tailscale 封装开销
+	}
+
+	// 优先从环境变量读取敏感配置
+	if authKey := os.Getenv("HEADSCALE_API_KEY"); authKey != "" {
+		conf.AuthKey = authKey
+	} else if authKey := os.Getenv("HEADCNI_AUTH_KEY"); authKey != "" {
+		conf.AuthKey = authKey
+	} else if authKeyPath := os.Getenv("HEADSCALE_API_KEY_FILE"); authKeyPath != "" {
+		// 从文件读取 API Key
+		authKeyBytes, err := os.ReadFile(authKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read API key from file %s: %v", authKeyPath, err)
+		}
+		conf.AuthKey = strings.TrimSpace(string(authKeyBytes))
+	} else if authKeyPath := os.Getenv("HEADCNI_AUTH_KEY_FILE"); authKeyPath != "" {
+		// 从文件读取 API Key
+		authKeyBytes, err := os.ReadFile(authKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read API key from file %s: %v", authKeyPath, err)
+		}
+		conf.AuthKey = strings.TrimSpace(string(authKeyBytes))
+	}
+
+	// 验证必需的配置
+	if conf.HeadscaleURL == "" {
+		return nil, fmt.Errorf("headscale_url is required")
+	}
+	if conf.AuthKey == "" {
+		return nil, fmt.Errorf("auth_key is required (set HEADSCALE_API_KEY or HEADCNI_AUTH_KEY environment variable)")
 	}
 
 	// 获取节点名
@@ -497,10 +547,13 @@ func loadConfig(stdinData []byte, cniArgs string) (*CNIPlugin, error) {
 		return nil, fmt.Errorf("invalid pod CIDR %s: %v", conf.PodCIDR, err)
 	}
 
-	// 创建 IPAM Manager
-	ipamManager, err := ipam.NewIPAMManager(nodeName, podCIDR)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create IPAM manager: %v", err)
+	// 创建 IPAM Manager（仅用于 headcni-ipam 类型）
+	var ipamManager *ipam.IPAMManager
+	if conf.IPAM.Type == "headcni-ipam" {
+		ipamManager, err = ipam.NewIPAMManager(nodeName, podCIDR)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create IPAM manager: %v", err)
+		}
 	}
 
 	// 创建网络管理器
@@ -541,4 +594,46 @@ func (p *CNIPlugin) getTailscaleGateway() net.IP {
 	gateway[len(gateway)-1] = 1
 
 	return gateway
+}
+
+// allocateWithHostLocal 使用 host-local IPAM 分配 IP
+func (p *CNIPlugin) allocateWithHostLocal(podInfo *PodInfo, containerID string) (*ipam.IPAllocation, error) {
+	// 使用内置的 host-local 逻辑
+	_, podCIDR, err := net.ParseCIDR(p.config.PodCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pod CIDR: %v", err)
+	}
+
+	// 简单的顺序分配逻辑
+	allocation := &ipam.IPAllocation{
+		IP:           p.getNextHostLocalIP(podCIDR),
+		PodNamespace: podInfo.Namespace,
+		PodName:      podInfo.Name,
+		ContainerID:  containerID,
+		NodeName:     os.Getenv("NODE_NAME"),
+		AllocatedAt:  time.Now(),
+	}
+
+	return allocation, nil
+}
+
+// releaseIP 释放 IP 地址
+func (p *CNIPlugin) releaseIP(podInfo *PodInfo, containerID string) {
+	switch p.config.IPAM.Type {
+	case "headcni-ipam":
+		p.ipamManager.ReleaseIP(context.Background(), podInfo.Namespace, podInfo.Name)
+	case "host-local":
+		// host-local 不需要特殊释放逻辑
+	}
+}
+
+// getNextHostLocalIP 获取下一个 host-local IP
+func (p *CNIPlugin) getNextHostLocalIP(podCIDR *net.IPNet) net.IP {
+	// 简单的顺序分配，从 .10 开始
+	ip := make(net.IP, len(podCIDR.IP))
+	copy(ip, podCIDR.IP)
+	ip[len(ip)-1] = 10 // 从 .10 开始
+
+	// 这里应该实现更复杂的分配逻辑，包括检查已分配的 IP
+	return ip
 }

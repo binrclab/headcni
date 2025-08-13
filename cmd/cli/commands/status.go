@@ -156,7 +156,7 @@ func runStatus(opts *StatusOptions) error {
 }
 
 func getDaemonSetStatus(opts *StatusOptions, status *ClusterStatus) error {
-	fmt.Printf("📊 DaemonSet Status:\n")
+	showSubSectionHeader("DaemonSet Status")
 
 	cmd := exec.Command("kubectl", "get", "daemonset", opts.ReleaseName,
 		"-n", opts.Namespace, "-o", "json")
@@ -164,7 +164,14 @@ func getDaemonSetStatus(opts *StatusOptions, status *ClusterStatus) error {
 	if err != nil {
 		status.DaemonSet.Name = opts.ReleaseName
 		status.DaemonSet.Namespace = opts.Namespace
-		fmt.Printf("❌ DaemonSet not found\n")
+
+		// 使用状态卡片显示
+		statusItems := map[string]string{
+			"Name":      opts.ReleaseName,
+			"Namespace": opts.Namespace,
+			"Status":    "Not Found",
+		}
+		showStatusCard("DaemonSet", statusItems)
 		return nil
 	}
 
@@ -182,30 +189,36 @@ func getDaemonSetStatus(opts *StatusOptions, status *ClusterStatus) error {
 	status.DaemonSet.Available = int(statusObj["numberAvailable"].(float64))
 	status.DaemonSet.UpToDate = int(statusObj["updatedNumberScheduled"].(float64))
 
-	fmt.Printf("   Name: %s\n", status.DaemonSet.Name)
-	fmt.Printf("   Desired: %d, Current: %d, Ready: %d, Available: %d, Up-to-date: %d\n",
-		status.DaemonSet.Desired, status.DaemonSet.Current, status.DaemonSet.Ready,
-		status.DaemonSet.Available, status.DaemonSet.UpToDate)
-
-	if status.DaemonSet.Ready == status.DaemonSet.Desired {
-		fmt.Printf("   ✅ DaemonSet is healthy\n")
-	} else {
-		fmt.Printf("   ⚠️  DaemonSet has issues\n")
+	// 使用状态卡片显示
+	statusItems := map[string]string{
+		"Name":       status.DaemonSet.Name,
+		"Namespace":  status.DaemonSet.Namespace,
+		"Desired":    fmt.Sprintf("%d", status.DaemonSet.Desired),
+		"Current":    fmt.Sprintf("%d", status.DaemonSet.Current),
+		"Ready":      fmt.Sprintf("%d", status.DaemonSet.Ready),
+		"Available":  fmt.Sprintf("%d", status.DaemonSet.Available),
+		"Up-to-date": fmt.Sprintf("%d", status.DaemonSet.UpToDate),
 	}
 
-	fmt.Printf("\n")
+	if status.DaemonSet.Ready == status.DaemonSet.Desired {
+		statusItems["Health"] = "Healthy"
+	} else {
+		statusItems["Health"] = "Issues Detected"
+	}
+
+	showStatusCard("DaemonSet", statusItems)
 	return nil
 }
 
 func getPodStatus(opts *StatusOptions, status *ClusterStatus) error {
-	fmt.Printf("📦 Pod Status:\n")
+	showSubSectionHeader("Pod Status")
 
 	cmd := exec.Command("kubectl", "get", "pods",
 		"-l", "app.kubernetes.io/name=headcni",
 		"-n", opts.Namespace, "-o", "json")
 	output, err := cmd.Output()
 	if err != nil {
-		fmt.Printf("❌ No pods found\n")
+		showWarningMessage("No pods found")
 		return nil
 	}
 
@@ -215,6 +228,11 @@ func getPodStatus(opts *StatusOptions, status *ClusterStatus) error {
 	}
 
 	pods := podList["items"].([]interface{})
+
+	// 准备表格数据
+	headers := []string{"Name", "Node", "Status", "Ready", "Restarts"}
+	var rows [][]string
+
 	for _, pod := range pods {
 		podObj := pod.(map[string]interface{})
 		metadata := podObj["metadata"].(map[string]interface{})
@@ -241,23 +259,33 @@ func getPodStatus(opts *StatusOptions, status *ClusterStatus) error {
 
 		status.Pods = append(status.Pods, podInfo)
 
-		statusIcon := "❌"
-		if podInfo.Status == "Running" && podInfo.Ready {
-			statusIcon = "✅"
-		} else if podInfo.Status == "Pending" {
-			statusIcon = "⏳"
+		// 添加到表格行
+		readyStatus := "False"
+		if podInfo.Ready {
+			readyStatus = "True"
 		}
 
-		fmt.Printf("   %s %s (Node: %s) - Status: %s, Ready: %v, Restarts: %d\n",
-			statusIcon, podInfo.Name, podInfo.Node, podInfo.Status, podInfo.Ready, podInfo.Restarts)
+		rows = append(rows, []string{
+			podInfo.Name,
+			podInfo.Node,
+			podInfo.Status,
+			readyStatus,
+			fmt.Sprintf("%d", podInfo.Restarts),
+		})
 	}
 
-	fmt.Printf("\n")
+	// 显示表格
+	if len(rows) > 0 {
+		showTable(headers, rows)
+	} else {
+		showWarningMessage("No HeadCNI pods found")
+	}
+
 	return nil
 }
 
 func getNodeStatus(status *ClusterStatus) error {
-	fmt.Printf("🖥️  Node Status:\n")
+	showSubSectionHeader("Node Status")
 
 	cmd := exec.Command("kubectl", "get", "nodes", "-o", "json")
 	output, err := cmd.Output()
@@ -271,6 +299,11 @@ func getNodeStatus(status *ClusterStatus) error {
 	}
 
 	nodes := nodeList["items"].([]interface{})
+
+	// 准备表格数据
+	headers := []string{"Name", "IP", "Ready", "CNI Ready"}
+	var rows [][]string
+
 	for _, node := range nodes {
 		nodeObj := node.(map[string]interface{})
 		metadata := nodeObj["metadata"].(map[string]interface{})
@@ -303,21 +336,35 @@ func getNodeStatus(status *ClusterStatus) error {
 
 		status.Nodes = append(status.Nodes, nodeInfo)
 
-		statusIcon := "❌"
+		// 添加到表格行
+		readyStatus := "False"
 		if nodeInfo.Ready {
-			statusIcon = "✅"
+			readyStatus = "True"
 		}
 
-		fmt.Printf("   %s %s (IP: %s) - Ready: %v\n",
-			statusIcon, nodeInfo.Name, nodeInfo.IP, nodeInfo.Ready)
+		cniReadyStatus := "Unknown"
+		// 这里可以添加CNI就绪状态检查逻辑
+
+		rows = append(rows, []string{
+			nodeInfo.Name,
+			nodeInfo.IP,
+			readyStatus,
+			cniReadyStatus,
+		})
 	}
 
-	fmt.Printf("\n")
+	// 显示表格
+	if len(rows) > 0 {
+		showTable(headers, rows)
+	} else {
+		showWarningMessage("No nodes found")
+	}
+
 	return nil
 }
 
 func getCNIStatus(status *ClusterStatus) error {
-	fmt.Printf("🌐 CNI Status:\n")
+	showSubSectionHeader("CNI Status")
 
 	// 检查 CNI 二进制文件
 	cmd := exec.Command("kubectl", "get", "nodes", "-o", "jsonpath={.items[0].status.nodeInfo.kubeletVersion}")
@@ -325,11 +372,9 @@ func getCNIStatus(status *ClusterStatus) error {
 	if err == nil {
 		status.CNI.Installed = true
 		status.CNI.Version = strings.TrimSpace(string(output))
-		fmt.Printf("   ✅ CNI plugin installed\n")
-		fmt.Printf("   Version: %s\n", status.CNI.Version)
 	} else {
 		status.CNI.Installed = false
-		fmt.Printf("   ❌ CNI plugin not found\n")
+		status.CNI.Version = "Unknown"
 	}
 
 	// 检查 CNI 配置
@@ -337,18 +382,23 @@ func getCNIStatus(status *ClusterStatus) error {
 	output, err = cmd.Output()
 	if err == nil && len(output) > 0 {
 		status.CNI.Config = "Configured"
-		fmt.Printf("   ✅ CNI configuration found\n")
 	} else {
 		status.CNI.Config = "Not configured"
-		fmt.Printf("   ❌ CNI configuration not found\n")
 	}
 
-	fmt.Printf("\n")
+	// 使用状态卡片显示
+	statusItems := map[string]string{
+		"Plugin Installed": fmt.Sprintf("%v", status.CNI.Installed),
+		"Version":          status.CNI.Version,
+		"Configuration":    status.CNI.Config,
+	}
+
+	showStatusCard("CNI", statusItems)
 	return nil
 }
 
 func getTailscaleStatus(status *ClusterStatus) error {
-	fmt.Printf("🔗 Tailscale Status:\n")
+	showSubSectionHeader("Tailscale Status")
 
 	// 尝试获取 Tailscale 状态
 	cmd := exec.Command("tailscale", "status", "--json")
@@ -356,8 +406,7 @@ func getTailscaleStatus(status *ClusterStatus) error {
 	if err != nil {
 		status.Tailscale.Connected = false
 		status.Tailscale.Status = "Not connected"
-		fmt.Printf("   ❌ Tailscale not connected\n")
-		fmt.Printf("   Status: %s\n", status.Tailscale.Status)
+		status.Tailscale.IP = "N/A"
 	} else {
 		var tailscaleStatus map[string]interface{}
 		if err := json.Unmarshal(output, &tailscaleStatus); err == nil {
@@ -366,14 +415,30 @@ func getTailscaleStatus(status *ClusterStatus) error {
 					status.Tailscale.Connected = true
 					status.Tailscale.IP = ips[0].(string)
 					status.Tailscale.Status = "Connected"
-					fmt.Printf("   ✅ Tailscale connected\n")
-					fmt.Printf("   IP: %s\n", status.Tailscale.IP)
+				} else {
+					status.Tailscale.Connected = false
+					status.Tailscale.Status = "No IP assigned"
+					status.Tailscale.IP = "N/A"
 				}
+			} else {
+				status.Tailscale.Connected = false
+				status.Tailscale.Status = "Status unknown"
+				status.Tailscale.IP = "N/A"
 			}
+		} else {
+			status.Tailscale.Connected = false
+			status.Tailscale.Status = "Parse error"
+			status.Tailscale.IP = "N/A"
 		}
 	}
 
-	fmt.Printf("\n")
+	// 使用状态卡片显示
+	statusItems := map[string]string{
+		"Connected": status.Tailscale.Status,
+		"IP":        status.Tailscale.IP,
+	}
+
+	showStatusCard("Tailscale", statusItems)
 	return nil
 }
 

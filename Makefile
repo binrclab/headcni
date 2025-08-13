@@ -22,7 +22,7 @@ EXAMPLES_DIR := examples
 PKG_DIR := pkg
 
 # 二进制文件
-BINARIES := headcni headcni-ipam headcni-cli
+BINARIES := headcni headcni-ipam headcni-cli headcni-daemon
 BIN_FILES := $(addprefix $(BIN_DIR)/,$(BINARIES))
 
 # 安装路径
@@ -34,7 +34,7 @@ CONFIG_DIR := /etc/headcni
 DATA_DIR := /var/lib/cni/headcni
 
 # 服务名称
-SERVICE_NAME := headcni-node
+SERVICE_NAME := headcni-daemon
 
 # 默认目标
 .PHONY: all
@@ -50,20 +50,20 @@ help:
 	@echo "  build          - 构建核心组件 (headcni + headcni-ipam)"
 	@echo "  build-ipam     - 构建 headcni-ipam"
 	@echo "  build-main     - 构建主 CNI 插件"
-	@echo "  build-node     - 构建 headcni-node (可选)"
+	@echo "  build-daemon   - 构建 headcni-daemon (可选)"
 	@echo "  build-daemon   - 构建 headcni-daemon (可选)"
 	@echo "  clean          - 清理构建文件"
 	@echo ""
 	@echo "安装目标:"
 	@echo "  install        - 安装核心组件到系统"
 	@echo "  install-cni    - 安装 CNI 插件"
-	@echo "  install-node   - 安装 headcni-node 服务 (可选)"
+	@echo "  install-daemon - 安装 headcni-daemon 服务 (可选)"
 	@echo "  uninstall      - 卸载所有组件"
 	@echo ""
 	@echo "服务管理:"
-	@echo "  start          - 启动 headcni-node 服务"
-	@echo "  stop           - 停止 headcni-node 服务"
-	@echo "  restart        - 重启 headcni-node 服务"
+	@echo "  start          - 启动 headcni-daemon 服务"
+	@echo "  stop           - 停止 headcni-daemon 服务"
+	@echo "  restart        - 重启 headcni-daemon 服务"
 	@echo "  status         - 查看服务状态"
 	@echo "  logs           - 查看服务日志"
 	@echo ""
@@ -115,11 +115,6 @@ build-main: $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni ./cmd/headcni/main.go
 
 # 可选组件构建目标
-.PHONY: build-node
-build-node: $(BIN_DIR)
-	@echo "构建 headcni-node (可选)..."
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-node ./cmd/headcni-node/
-
 .PHONY: build-daemon
 build-daemon: $(BIN_DIR)
 	@echo "构建 headcni-daemon (可选)..."
@@ -133,6 +128,7 @@ build-cli: $(BIN_DIR)
 # 二进制文件依赖
 $(BIN_DIR)/headcni-ipam: build-ipam
 $(BIN_DIR)/headcni: build-main
+$(BIN_DIR)/headcni-daemon: build-daemon
 $(BIN_DIR)/headcni-cli: build-cli
 
 # 清理目标
@@ -156,8 +152,10 @@ install-cni: build
 	sudo mkdir -p $(CNI_CONF_DIR)
 	sudo cp $(BIN_DIR)/headcni $(CNI_BIN_DIR)/
 	sudo cp $(BIN_DIR)/headcni-ipam $(CNI_BIN_DIR)/
+	sudo cp $(BIN_DIR)/headcni-daemon $(CNI_BIN_DIR)/
 	sudo chmod +x $(CNI_BIN_DIR)/headcni
 	sudo chmod +x $(CNI_BIN_DIR)/headcni-ipam
+	sudo chmod +x $(CNI_BIN_DIR)/headcni-daemon
 	@echo "CLI 工具已构建，可以运行: ./bin/headcni-cli --help"
 	@if [ -f $(EXAMPLES_DIR)/cni-config.json ]; then \
 		sudo cp $(EXAMPLES_DIR)/cni-config.json $(CNI_CONF_DIR)/10-headcni.conf; \
@@ -166,9 +164,9 @@ install-cni: build
 	fi
 	@echo "CNI 插件安装完成"
 
-.PHONY: install-node
-install-node: build
-	@echo "安装 headcni-node 服务..."
+.PHONY: install-daemon
+install-daemon: build
+	@echo "安装 headcni-daemon 服务..."
 	sudo mkdir -p $(CONFIG_DIR)
 	sudo mkdir -p $(DATA_DIR)
 	@if [ ! -f $(CONFIG_DIR)/auth-key ]; then \
@@ -176,24 +174,24 @@ install-node: build
 		echo "然后设置权限: sudo chmod 600 $(CONFIG_DIR)/auth-key"; \
 	fi
 	@echo "创建 systemd 服务文件..."
-	@echo "[Unit]" > /tmp/headcni-node.service
-	@echo "Description=HeadCNI Node Service" >> /tmp/headcni-node.service
-	@echo "After=network.target" >> /tmp/headcni-node.service
-	@echo "" >> /tmp/headcni-node.service
-	@echo "[Service]" >> /tmp/headcni-node.service
-	@echo "Type=simple" >> /tmp/headcni-node.service
-	@echo "User=root" >> /tmp/headcni-node.service
-	@echo "ExecStart=$(shell pwd)/$(BIN_DIR)/headcni-node --headscale-url=http://localhost:50443 --headscale-namespace=default --auth-key-file=$(CONFIG_DIR)/auth-key --log-level=info --debug=false" >> /tmp/headcni-node.service
-	@echo "Restart=always" >> /tmp/headcni-node.service
-	@echo "RestartSec=5" >> /tmp/headcni-node.service
-	@echo "Environment=NODE_NAME=$$(hostname)" >> /tmp/headcni-node.service
-	@echo "" >> /tmp/headcni-node.service
-	@echo "[Install]" >> /tmp/headcni-node.service
-	@echo "WantedBy=multi-user.target" >> /tmp/headcni-node.service
-	sudo cp /tmp/headcni-node.service $(SYSTEMD_DIR)/
+	@echo "[Unit]" > /tmp/headcni-daemon.service
+	@echo "Description=HeadCNI Daemon Service" >> /tmp/headcni-daemon.service
+	@echo "After=network.target" >> /tmp/headcni-daemon.service
+	@echo "" >> /tmp/headcni-daemon.service
+	@echo "[Service]" >> /tmp/headcni-daemon.service
+	@echo "Type=simple" >> /tmp/headcni-daemon.service
+	@echo "User=root" >> /tmp/headcni-daemon.service
+	@echo "ExecStart=$(shell pwd)/$(BIN_DIR)/headcni-daemon --headscale-url=http://localhost:50443 --mode=host --auth-key-file=$(CONFIG_DIR)/auth-key" >> /tmp/headcni-daemon.service
+	@echo "Restart=always" >> /tmp/headcni-daemon.service
+	@echo "RestartSec=5" >> /tmp/headcni-daemon.service
+	@echo "Environment=NODE_NAME=$$(hostname)" >> /tmp/headcni-daemon.service
+	@echo "" >> /tmp/headcni-daemon.service
+	@echo "[Install]" >> /tmp/headcni-daemon.service
+	@echo "WantedBy=multi-user.target" >> /tmp/headcni-daemon.service
+	sudo cp /tmp/headcni-daemon.service $(SYSTEMD_DIR)/
 	sudo systemctl daemon-reload
 	sudo systemctl enable $(SERVICE_NAME)
-	@echo "headcni-node 服务安装完成"
+	@echo "headcni-daemon 服务安装完成"
 
 .PHONY: install-config
 install-config:

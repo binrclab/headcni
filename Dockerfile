@@ -1,66 +1,58 @@
-# Multi-stage build for HeadCNI
-FROM golang:1.21-alpine AS builder
+# 构建阶段
+FROM golang:1.24-alpine AS builder
 
-# Install build dependencies
+# 安装构建依赖
 RUN apk add --no-cache git make
 
-# Set working directory
+# 设置工作目录
 WORKDIR /app
 
-# Copy go mod files
-COPY go.mod go.sum ./
-
-# Download dependencies
-RUN go mod download
-
-# Copy source code
+# 复制源代码
 COPY . .
 
-# Build the application
+# 构建二进制文件
 RUN make build
 
-# Runtime stage
-FROM alpine:3.18
+# 运行时阶段
+FROM alpine:3.19
 
-# Install runtime dependencies
+# 安装 Tailscale 和必要的工具
 RUN apk add --no-cache \
-    ca-certificates \
+    tailscale \
     iptables \
     iproute2 \
+    net-tools \
+    curl \
+    ca-certificates \
     && rm -rf /var/cache/apk/*
 
-# Create non-root user
-RUN addgroup -g 1000 headcni && \
-    adduser -D -s /bin/sh -u 1000 -G headcni headcni
+# 创建必要的目录
+RUN mkdir -p \
+    /opt/cni/bin \
+    /etc/cni/net.d \
+    /var/lib/headcni \
+    /var/run/headcni \
+    /var/run/headcni/tailscale \
+    /var/lib/headcni/tailscale
 
-# Create necessary directories
-RUN mkdir -p /opt/cni/bin /etc/cni/net.d /var/lib/tailscale /var/run/tailscale && \
-    chown -R headcni:headcni /opt/cni /etc/cni /var/lib/tailscale /var/run/tailscale
+# 从构建阶段复制二进制文件
+COPY --from=builder /app/bin/headcni /opt/cni/bin/
+COPY --from=builder /app/bin/headcni-ipam /opt/cni/bin/
+COPY --from=builder /app/bin/headcni-daemon /opt/cni/bin/
+COPY --from=builder /app/bin/headcni-cli /opt/cni/bin/
 
-# Copy binaries from builder
-COPY --from=builder /app/headcni /opt/cni/bin/
-COPY --from=builder /app/headcni-ipam /opt/cni/bin/
-COPY --from=builder /app/bin/headcni-node /usr/local/bin/ 2>/dev/null || true
+# 设置执行权限
+RUN chmod +x /opt/cni/bin/*
 
-# Copy CNI configuration
-COPY --from=builder /app/10-headcni.conflist /etc/cni/net.d/
-COPY --from=builder /app/10-headcni-ipam.conflist /etc/cni/net.d/
+# 复制配置文件
+COPY chart/templates/configmap.yaml /etc/cni/net.d/10-headcni.conflist
 
-# Set permissions
-RUN chmod +x /opt/cni/bin/headcni /opt/cni/bin/headcni-ipam /usr/local/bin/headcni-node
+# 设置环境变量
+ENV PATH="/opt/cni/bin:$PATH"
 
-# Switch to non-root user
-USER headcni
-
-# Set working directory
-WORKDIR /app
-
-# Expose ports
-EXPOSE 8080 9090
-
-# Health check
+# 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1
+    CMD curl -f http://localhost:8080/health || exit 1
 
-# Default command
-CMD ["/usr/local/bin/headcni-node"] 
+# 默认命令
+CMD ["/opt/cni/bin/headcni-daemon"] 

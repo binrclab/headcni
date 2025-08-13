@@ -48,7 +48,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	}
 
 	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-node", subnet)
+	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
 	if err != nil {
 		return fmt.Errorf("failed to create IPAM manager: %v", err)
 	}
@@ -90,7 +90,7 @@ func cmdDel(args *skel.CmdArgs) error {
 	}
 
 	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-node", subnet)
+	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
 	if err != nil {
 		return fmt.Errorf("failed to create IPAM manager: %v", err)
 	}
@@ -118,7 +118,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 	}
 
 	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-node", subnet)
+	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
 	if err != nil {
 		return fmt.Errorf("failed to create IPAM manager: %v", err)
 	}

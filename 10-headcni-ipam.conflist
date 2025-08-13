@@ -1,6 +1,6 @@
 {
   "cniVersion": "1.0.0",
-  "name": "tailscale-cni",
+  "name": "headcni",
   "type": "headcni",
   
   "headscale_url": "https://headscale.company.com",
@@ -21,14 +21,13 @@
       }
     ]
   },
-  
-  "dns": {
-    "nameservers": ["10.96.0.10"],
-    "search": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
-    "options": ["ndots:5"]
+  "magic_dns": {
+    "enable": true,
+    "base_domain": "cluster.local",
+    "nameservers": ["10.2.0.1"],
+    "search_domains": ["c.binrc.com"]
   },
-  
-  "mtu": 1420,
+  "mtu": 1280,
   "enable_ipv6": false,
   "enable_network_policy": true
 } 

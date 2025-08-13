@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
 )
 
@@ -15,6 +16,7 @@ type ConfigOptions struct {
 	Output      string
 	Show        bool
 	Validate    bool
+	Action      string
 }
 
 func NewConfigCommand() *cobra.Command {
@@ -40,7 +42,7 @@ Examples:
   # Export configuration as JSON
   headcni config --show --output json`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runConfig(opts)
+			return runConfig(cmd, args)
 		},
 	}
 
@@ -53,44 +55,31 @@ Examples:
 	return cmd
 }
 
-func runConfig(opts *ConfigOptions) error {
-	// 显示 ASCII logo
+func runConfig(cmd *cobra.Command, args []string) error {
 	showLogo()
-	
-	fmt.Printf("⚙️  HeadCNI Configuration Management\n")
-	fmt.Printf("Namespace: %s\n", opts.Namespace)
-	fmt.Printf("Release Name: %s\n\n", opts.ReleaseName)
 
-	// 检查集群连接
-	if err := checkClusterConnection(); err != nil {
-		return fmt.Errorf("cluster connection failed: %v", err)
+	opts := &ConfigOptions{
+		Namespace:   "kube-system",
+		ReleaseName: "headcni",
 	}
 
-	// 检查是否已安装
-	if err := checkInstallation(&UninstallOptions{Namespace: opts.Namespace, ReleaseName: opts.ReleaseName}); err != nil {
-		return fmt.Errorf("HeadCNI is not installed: %v", err)
+	// 解析命令行参数
+	if len(args) > 0 {
+		opts.Action = args[0]
 	}
 
-	if opts.Show {
-		if err := showConfig(opts); err != nil {
-			return fmt.Errorf("failed to show config: %v", err)
-		}
+	switch opts.Action {
+	case "show":
+		return showConfig(opts)
+	case "validate":
+		return validateConfig(opts)
+	case "export":
+		return exportConfig(opts)
+	case "explain":
+		return explainConfig(opts)
+	default:
+		return showConfigHelp()
 	}
-
-	if opts.Validate {
-		if err := validateConfig(opts); err != nil {
-			return fmt.Errorf("config validation failed: %v", err)
-		}
-	}
-
-	// 如果没有指定操作，默认显示配置
-	if !opts.Show && !opts.Validate {
-		if err := showConfig(opts); err != nil {
-			return fmt.Errorf("failed to show config: %v", err)
-		}
-	}
-
-	return nil
 }
 
 func showConfig(opts *ConfigOptions) error {
@@ -229,4 +218,67 @@ func validateConfig(opts *ConfigOptions) error {
 	fmt.Printf("\n✅ Configuration validation passed!\n")
 
 	return nil
-} 
+}
+
+// exportConfig 导出配置
+func exportConfig(opts *ConfigOptions) error {
+	pterm.Info.Println("📤 Exporting configuration...")
+
+	// 获取配置并导出
+	cmd := exec.Command("kubectl", "get", "configmap", opts.ReleaseName+"-config", "-n", opts.Namespace, "-o", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to export config: %v", err)
+	}
+
+	fmt.Println(string(output))
+	return nil
+}
+
+// showConfigHelp 显示配置帮助
+func showConfigHelp() error {
+	pterm.DefaultSection.Println("HeadCNI Configuration Management")
+
+	help := `Available commands:
+  show     - Show current configuration
+  validate - Validate configuration
+  export   - Export configuration as JSON
+  explain  - Explain configuration parameters
+
+Examples:
+  headcni config show
+  headcni config validate
+  headcni config export
+  headcni config explain`
+
+	pterm.DefaultBox.Println(help)
+	return nil
+}
+
+// explainConfig 解释配置参数
+func explainConfig(opts *ConfigOptions) error {
+	showConfigExplanation()
+
+	// 显示简化配置示例
+	pterm.DefaultSection.Println("Simplified Configuration Example")
+	pterm.DefaultBox.WithTitle("10-headcni-ipam.conflist").Println(generateSimplifiedConfig())
+
+	// 显示环境变量配置
+	pterm.DefaultSection.Println("Environment Variables Configuration")
+	envConfig := `# 敏感配置通过环境变量设置
+HEADSCALE_URL=https://headscale.company.com
+TAILSCALE_SOCKET=/var/run/tailscale/tailscaled.sock
+
+# 网络配置
+POD_CIDR=10.244.0.0/24
+SERVICE_CIDR=10.96.0.0/16
+MTU=1420
+
+# IPAM 配置
+IPAM_TYPE=headcni-ipam
+ALLOCATION_STRATEGY=sequential`
+
+	pterm.DefaultBox.WithTitle("headcni.env").Println(envConfig)
+
+	return nil
+}
