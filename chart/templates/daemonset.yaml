@@ -1,0 +1,146 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "headcni.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "headcni.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "headcni.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "headcni.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      serviceAccountName: {{ include "headcni.fullname" . }}
+      containers:
+      - name: headcni
+        image: "{{ .Values.image.repository }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+        - /opt/cni/bin/headcni
+        - --headscale-url={{ .Values.config.headscale.url }}
+        - --pod-cidr={{ .Values.config.network.podCIDRBase }}
+        - --service-cidr={{ .Values.config.network.serviceCIDR }}
+        - --mtu={{ .Values.config.network.mtu }}
+        - --ipam-type={{ .Values.config.ipam.type }}
+        - --allocation-strategy={{ .Values.config.ipam.strategy }}
+        {{- if .Values.config.monitoring.enabled }}
+        - --metrics-port={{ .Values.config.monitoring.port }}
+        - --metrics-path={{ .Values.config.monitoring.path }}
+        {{- end }}
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        {{- if .Values.config.headscale.authKey }}
+        - name: HEADSCALE_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "headcni.fullname" . }}-auth
+              key: auth-key
+        {{- end }}
+        securityContext:
+          privileged: true
+          capabilities:
+            add:
+            - NET_ADMIN
+            - SYS_ADMIN
+        volumeMounts:
+        - name: cni-bin
+          mountPath: /opt/cni/bin
+        - name: cni-conf
+          mountPath: /etc/cni/net.d
+        - name: tailscale-socket
+          mountPath: /var/run/tailscale
+        - name: headcni-data
+          mountPath: /var/lib/headcni
+        {{- if .Values.config.monitoring.enabled }}
+        ports:
+        - name: metrics
+          containerPort: {{ .Values.config.monitoring.port }}
+          protocol: TCP
+        {{- end }}
+        resources:
+          {{- toYaml .Values.resources.manager | nindent 10 }}
+        {{- if .Values.config.monitoring.enabled }}
+        livenessProbe:
+          httpGet:
+            path: {{ .Values.config.monitoring.path | trimPrefix "/" }}
+            port: {{ .Values.config.monitoring.port }}
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: {{ .Values.config.monitoring.path | trimPrefix "/" }}
+            port: {{ .Values.config.monitoring.port }}
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        {{- end }}
+      volumes:
+      - name: cni-bin
+        hostPath:
+          path: /opt/cni/bin
+          type: Directory
+      - name: cni-conf
+        hostPath:
+          path: /etc/cni/net.d
+          type: Directory
+      - name: tailscale-socket
+        hostPath:
+          path: /var/run/tailscale
+          type: DirectoryOrCreate
+      - name: headcni-data
+        hostPath:
+          path: /var/lib/headcni
+          type: DirectoryOrCreate
+      - name: config
+        configMap:
+          name: {{ include "headcni.fullname" . }}-config
+      initContainers:
+      - name: install-cni
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        command:
+        - /bin/sh
+        - -c
+        - |
+          cp /opt/cni/bin/headcni /host/opt/cni/bin/
+          cp /opt/cni/bin/headcni-ipam /host/opt/cni/bin/
+          chmod +x /host/opt/cni/bin/headcni
+          chmod +x /host/opt/cni/bin/headcni-ipam
+          {{- if eq .Values.config.ipam.type "headcni-ipam" }}
+          cp /etc/cni/net.d/10-headcni-ipam.conflist /host/etc/cni/net.d/
+          {{- else }}
+          cp /etc/cni/net.d/10-headcni.conflist /host/etc/cni/net.d/
+          {{- end }}
+        volumeMounts:
+        - name: cni-bin
+          mountPath: /host/opt/cni/bin
+        - name: cni-conf
+          mountPath: /host/etc/cni/net.d
+        - name: config
+          mountPath: /etc/cni/net.d
+        securityContext:
+          privileged: true 

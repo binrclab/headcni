@@ -1,0 +1,18 @@
+apiVersion: v2
+name: headcni
+description: A Kubernetes CNI plugin that integrates Headscale and Tailscale
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - cni
+  - kubernetes
+  - tailscale
+  - headscale
+  - networking
+home: https://github.com/binrclab/headcni
+sources:
+  - https://github.com/binrclab/headcni
+maintainers:
+  - name: HeadCNI Team
+    email: team@headcni.com 

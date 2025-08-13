@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "headcni.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "headcni.labels" . | nindent 4 }}
+data:
+  # 使用 host-local IPAM 的配置
+  10-headcni.conflist: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "tailscale-cni",
+      "type": "headcni",
+      
+      "headscale_url": "{{ .Values.config.headscale.url }}",
+      "tailscale_socket": "/var/run/tailscale/tailscaled.sock",
+      
+      "pod_cidr": "{{ .Values.config.network.podCIDRBase }}",
+      "service_cidr": "{{ .Values.config.network.serviceCIDR }}",
+      
+      "ipam": {
+        "type": "host-local",
+        "subnet": "{{ .Values.config.network.podCIDRBase }}",
+        "rangeStart": "{{ .Values.config.network.podCIDRBase | replace "/16" ".10" | replace "/24" ".10" }}",
+        "rangeEnd": "{{ .Values.config.network.podCIDRBase | replace "/16" ".254" | replace "/24" ".254" }}",
+        "gateway": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}"
+      },
+      
+      "dns": {
+        "nameservers": ["{{ .Values.config.network.serviceCIDR | replace "/16" ".10" | replace "/12" ".10" }}"],
+        "search": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+        "options": ["ndots:5"]
+      },
+      
+      "mtu": {{ .Values.config.network.mtu }},
+      "enable_ipv6": {{ .Values.config.network.enableIPv6 | default false }},
+      "enable_network_policy": {{ .Values.config.network.enableNetworkPolicy | default true }}
+    }
+
+  # 使用 headcni-ipam 的配置
+  10-headcni-ipam.conflist: |
+    {
+      "cniVersion": "1.0.0",
+      "name": "tailscale-cni",
+      "type": "headcni",
+      
+      "headscale_url": "{{ .Values.config.headscale.url }}",
+      "tailscale_socket": "/var/run/tailscale/tailscaled.sock",
+      
+      "pod_cidr": "{{ .Values.config.network.podCIDRBase }}",
+      "service_cidr": "{{ .Values.config.network.serviceCIDR }}",
+      
+      "ipam": {
+        "type": "headcni-ipam",
+        "subnet": "{{ .Values.config.network.podCIDRBase }}",
+        "gateway": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}",
+        "allocation_strategy": "{{ .Values.config.ipam.strategy }}",
+        "routes": [
+          {
+            "dst": "0.0.0.0/0",
+            "gw": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}"
+          }
+        ]
+      },
+      
+      "dns": {
+        "nameservers": ["{{ .Values.config.network.serviceCIDR | replace "/16" ".10" | replace "/12" ".10" }}"],
+        "search": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+        "options": ["ndots:5"]
+      },
+      
+      "mtu": {{ .Values.config.network.mtu }},
+      "enable_ipv6": {{ .Values.config.network.enableIPv6 | default false }},
+      "enable_network_policy": {{ .Values.config.network.enableNetworkPolicy | default true }}
+    } 

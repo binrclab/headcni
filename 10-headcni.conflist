@@ -1,0 +1,29 @@
+{
+  "cniVersion": "1.0.0",
+  "name": "tailscale-cni",
+  "type": "headcni",
+  
+  "headscale_url": "https://headscale.company.com",
+  "tailscale_socket": "/var/run/tailscale/tailscaled.sock",
+  
+  "pod_cidr": "10.244.0.0/24",
+  "service_cidr": "10.96.0.0/16",
+  
+  "ipam": {
+    "type": "host-local",
+    "subnet": "10.244.0.0/24",
+    "rangeStart": "10.244.0.10",
+    "rangeEnd": "10.244.0.254",
+    "gateway": "10.244.0.1"
+  },
+  
+  "dns": {
+    "nameservers": ["10.96.0.10"],
+    "search": ["default.svc.cluster.local", "svc.cluster.local", "cluster.local"],
+    "options": ["ndots:5"]
+  },
+  
+  "mtu": 1420,
+  "enable_ipv6": false,
+  "enable_network_policy": true
+}
