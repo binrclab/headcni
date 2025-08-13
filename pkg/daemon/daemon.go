@@ -205,20 +205,11 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("failed to start CNI server: %v", err)
 	}
 
-	// 启动 Pod Informer
-	go d.podInformer.Run(d.ctx.Done())
-
-	// 等待 Informer 同步
-	if !cache.WaitForCacheSync(d.ctx.Done(), d.podInformer.HasSynced) {
-		return fmt.Errorf("failed to sync pod informer")
-	}
-
 	// 启动工作协程
-	d.wg.Add(4)
+	d.wg.Add(3)
 	go d.processPods()
 	go d.manageNetworkState()
 	go d.maintainHeadscaleConnection()
-	go d.manageTailscaleInterface()
 
 	d.logger.Info("HeadCNI daemon started successfully")
 	return nil
@@ -311,6 +302,8 @@ func (d *Daemon) handleCNIRequest(w http.ResponseWriter, r *http.Request) {
 		resp = d.handleReleaseRequest(req)
 	case "status":
 		resp = d.handleStatusRequest(req)
+	case "pod_ready":
+		resp = d.handlePodReadyRequest(req)
 	default:
 		resp = CNIResponse{
 			Success: false,
@@ -339,9 +332,26 @@ func (d *Daemon) handleAllocateRequest(req CNIRequest) CNIResponse {
 		}
 	}
 
-	// 分配新 IP（简化实现）
-	// 这里应该调用 IPAM 管理器
-	ip := net.ParseIP("10.244.0.100") // 临时实现
+	// 分配新 IP - 使用简单的顺序分配
+	_, podCIDR, err := net.ParseCIDR(d.config.PodCIDR)
+	if err != nil {
+		return CNIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("invalid pod CIDR: %v", err),
+		}
+	}
+
+	// 简单的顺序分配，从 .10 开始
+	ip := make(net.IP, len(podCIDR.IP))
+	copy(ip, podCIDR.IP)
+	ip[len(ip)-1] = 10 // 从 .10 开始
+
+	// 检查 IP 是否已被使用
+	for _, podInfo := range d.networkState.Pods {
+		if podInfo.IP.Equal(ip) {
+			ip[len(ip)-1]++ // 尝试下一个 IP
+		}
+	}
 
 	d.networkState.Pods[podKey] = &PodInfo{
 		Name:      req.PodName,
@@ -394,59 +404,93 @@ func (d *Daemon) handleStatusRequest(req CNIRequest) CNIResponse {
 	}
 }
 
+// handlePodReadyRequest 处理 Pod 就绪通知
+func (d *Daemon) handlePodReadyRequest(req CNIRequest) CNIResponse {
+	podKey := fmt.Sprintf("%s/%s", req.Namespace, req.PodName)
+
+	d.logger.Info("Received pod ready notification", "pod", podKey, "ip", req.PodIP)
+
+	// 根据模式处理 Pod
+	switch d.config.Mode {
+	case "host":
+		// Host 模式：请求 Headscale 路由
+		if err := d.requestHeadscaleRoute(req.PodIP); err != nil {
+			return CNIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to request headscale route: %v", err),
+			}
+		}
+	case "daemon":
+		// Daemon 模式：创建 Tailscale 节点和接口
+		nodeKey, err := d.createTailscaleNode(req.PodIP)
+		if err != nil {
+			return CNIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to create tailscale node: %v", err),
+			}
+		}
+
+		if err := d.createHeadCNIInterface(nodeKey); err != nil {
+			return CNIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to create headcni interface: %v", err),
+			}
+		}
+
+		if err := d.enablePodRoutes(req.PodIP); err != nil {
+			return CNIResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to enable pod routes: %v", err),
+			}
+		}
+
+		// 更新状态
+		d.stateMutex.Lock()
+		d.networkState.Pods[podKey] = &PodInfo{
+			Name:      req.PodName,
+			Namespace: req.Namespace,
+			IP:        net.ParseIP(req.PodIP),
+			NodeKey:   nodeKey,
+			Created:   time.Now(),
+		}
+		d.stateMutex.Unlock()
+	}
+
+	return CNIResponse{
+		Success: true,
+		Data: map[string]interface{}{
+			"message": "Pod network ready",
+		},
+	}
+}
+
 // processPods 处理 Pod 事件
 func (d *Daemon) processPods() {
+	// 现在主要依赖 CNI 插件的通知，这里只做状态清理
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
-		default:
-			// 处理队列中的 Pod
-			key, quit := d.podQueue.Get()
-			if quit {
-				return
-			}
+		case <-ticker.C:
+			d.cleanupOrphanedPods()
+		}
+	}
+}
 
-			func() {
-				defer d.podQueue.Done(key)
+// cleanupOrphanedPods 清理孤立的 Pod 状态
+func (d *Daemon) cleanupOrphanedPods() {
+	d.stateMutex.Lock()
+	defer d.stateMutex.Unlock()
 
-				// 解析 Pod 键
-				_, _, err := cache.SplitMetaNamespaceKey(key.(string))
-				if err != nil {
-					d.logger.Error("Failed to split pod key", "key", key, "error", err)
-					d.podQueue.Forget(key)
-					return
-				}
-
-				// 获取 Pod 对象
-				obj, exists, err := d.podInformer.GetIndexer().GetByKey(key.(string))
-				if err != nil {
-					d.logger.Error("Failed to get pod from cache", "key", key, "error", err)
-					d.podQueue.Forget(key)
-					return
-				}
-
-				if !exists {
-					// Pod 已删除
-					d.handlePodDeleted(obj)
-					d.podQueue.Forget(key)
-					return
-				}
-
-				pod := obj.(*corev1.Pod)
-
-				// 根据模式处理 Pod
-				switch d.config.Mode {
-				case "host":
-					d.handleHostModePod(pod)
-				case "daemon":
-					d.handleDaemonModePod(pod)
-				default:
-					d.logger.Error("Unknown mode", "mode", d.config.Mode)
-				}
-
-				d.podQueue.Forget(key)
-			}()
+	// 清理超过 1 小时未更新的 Pod 状态
+	cutoff := time.Now().Add(-1 * time.Hour)
+	for podKey, podInfo := range d.networkState.Pods {
+		if podInfo.Created.Before(cutoff) {
+			d.logger.Info("Cleaning up orphaned pod state", "pod", podKey)
+			delete(d.networkState.Pods, podKey)
 		}
 	}
 }

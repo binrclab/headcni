@@ -18,6 +18,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 
+	"github.com/binrclab/headcni/pkg/cni"
 	"github.com/binrclab/headcni/pkg/ipam"
 	"github.com/binrclab/headcni/pkg/networking"
 	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
@@ -60,6 +61,7 @@ type CNIPlugin struct {
 	config      *NetConf
 	ipamManager *ipam.IPAMManager
 	networkMgr  *networking.NetworkManager
+	cniClient   *cni.Client
 }
 
 func main() {
@@ -119,6 +121,13 @@ func cmdAdd(args *skel.CmdArgs) error {
 		// 出错时清理分配的 IP
 		plugin.releaseIP(podInfo, args.ContainerID)
 		return fmt.Errorf("failed to setup pod network: %v", err)
+	}
+
+	// 通知 Daemon Pod 网络已配置完成
+	if plugin.cniClient != nil {
+		if err := plugin.notifyDaemonPodReady(podInfo, allocation); err != nil {
+			klog.Warningf("Failed to notify daemon: %v", err)
+		}
 	}
 
 	klog.Infof("Successfully configured network for pod %s/%s with IP %s",
@@ -565,10 +574,16 @@ func loadConfig(stdinData []byte, cniArgs string) (*CNIPlugin, error) {
 		return nil, fmt.Errorf("failed to create network manager: %v", err)
 	}
 
+	// 创建 CNI 客户端（用于与 Daemon 通信）
+	var cniClient *cni.Client
+	// Daemon 模式需要与 Daemon 通信，无论使用哪种 IPAM
+	cniClient = cni.NewClient("/var/run/headcni/daemon.sock")
+
 	return &CNIPlugin{
 		config:      conf,
 		ipamManager: ipamManager,
 		networkMgr:  networkMgr,
+		cniClient:   cniClient,
 	}, nil
 }
 
@@ -636,4 +651,27 @@ func (p *CNIPlugin) getNextHostLocalIP(podCIDR *net.IPNet) net.IP {
 
 	// 这里应该实现更复杂的分配逻辑，包括检查已分配的 IP
 	return ip
+}
+
+// notifyDaemonPodReady 通知 Daemon Pod 网络已配置完成
+func (p *CNIPlugin) notifyDaemonPodReady(podInfo *PodInfo, allocation *ipam.IPAllocation) error {
+	// 通过 CNI 客户端通知 Daemon
+	req := &cni.Request{
+		Type:        "pod_ready",
+		Namespace:   podInfo.Namespace,
+		PodName:     podInfo.Name,
+		ContainerID: allocation.ContainerID,
+		PodIP:       allocation.IP.String(),
+	}
+
+	resp, err := p.cniClient.SendRequest(req)
+	if err != nil {
+		return fmt.Errorf("failed to notify daemon: %v", err)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("daemon notification failed: %s", resp.Error)
+	}
+
+	return nil
 }
