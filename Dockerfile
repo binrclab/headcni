@@ -4,6 +4,10 @@ FROM golang:1.24-alpine AS builder
 # 安装构建依赖
 RUN apk add --no-cache git make
 
+# 设置 Go 代理为中国镜像
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
+
 # 设置工作目录
 WORKDIR /app
 
@@ -13,12 +17,18 @@ COPY . .
 # 构建二进制文件
 RUN make build
 
+# 安装与代码版本一致的 Tailscale
+RUN go install tailscale.com/cmd/tailscale@v1.86.4 && \
+    go install tailscale.com/cmd/tailscaled@v1.86.4 && \
+    ls -la $(go env GOPATH)/bin/ && \
+    cp $(go env GOPATH)/bin/tailscale /app/bin/ && \
+    cp $(go env GOPATH)/bin/tailscaled /app/bin/
+
 # 运行时阶段
 FROM alpine:3.19
 
-# 安装 Tailscale 和必要的工具
+# 安装必要的工具
 RUN apk add --no-cache \
-    tailscale \
     iptables \
     iproute2 \
     net-tools \
@@ -40,6 +50,10 @@ COPY --from=builder /app/bin/headcni /opt/cni/bin/
 COPY --from=builder /app/bin/headcni-ipam /opt/cni/bin/
 COPY --from=builder /app/bin/headcni-daemon /opt/cni/bin/
 COPY --from=builder /app/bin/headcni-cli /opt/cni/bin/
+
+# 从构建阶段复制 Tailscale 二进制文件
+COPY --from=builder /app/bin/tailscale /usr/local/bin/
+COPY --from=builder /app/bin/tailscaled /usr/local/bin/
 
 # 设置执行权限
 RUN chmod +x /opt/cni/bin/*

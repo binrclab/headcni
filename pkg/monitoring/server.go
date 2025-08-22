@@ -4,20 +4,25 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+
+	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
 )
 
 // Server 是监控服务器
 type Server struct {
-	port   int
-	path   string
-	server *http.Server
+	Enabled bool   `yaml:"enabled"`
+	Port    int    `yaml:"port"`
+	Path    string `yaml:"path"`
+	server  *http.Server
 }
 
 // NewServer 创建新的监控服务器
-func NewServer(port int, path string) *Server {
+func NewServer(monitConfig *config.MonitoringConfig) *Server {
+
 	return &Server{
-		port: port,
-		path: path,
+		Enabled: monitConfig.Enabled,
+		Port:    monitConfig.Port,
+		Path:    monitConfig.Path,
 	}
 }
 
@@ -32,7 +37,7 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	// 指标端点
-	mux.HandleFunc(s.path, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(s.Path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.Write([]byte("# HeadCNI metrics\n"))
 		w.Write([]byte("headcni_pods_total 0\n"))
@@ -40,7 +45,7 @@ func (s *Server) Start(ctx context.Context) error {
 	})
 
 	s.server = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
+		Addr:    fmt.Sprintf(":%d", s.Port),
 		Handler: mux,
 	}
 

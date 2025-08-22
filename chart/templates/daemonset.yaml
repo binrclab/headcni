@@ -14,43 +14,118 @@ spec:
       labels:
         {{- include "headcni.selectorLabels" . | nindent 8 }}
     spec:
+      # Use host network mode, CNI plugin needs direct access to host network
+      hostNetwork: true
+      # Use host PID namespace for process management
+      hostPID: true
       serviceAccountName: {{ include "headcni.serviceAccountName" . }}
+      # Set restart policy
+      restartPolicy: Always
+      # Termination grace period
+      terminationGracePeriodSeconds: 30
       initContainers:
-      - name: install-cni
+      - name: setup-headcni
         image: "{{ .Values.image.repository }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         command:
         - /bin/sh
         - -c
         - |
+          # 1. Install necessary CNI binaries to host
           cp /opt/cni/bin/headcni /host/opt/cni/bin/
           cp /opt/cni/bin/headcni-ipam /host/opt/cni/bin/
-          cp /opt/cni/bin/headcni-daemon /host/opt/cni/bin/
           chmod +x /host/opt/cni/bin/headcni
           chmod +x /host/opt/cni/bin/headcni-ipam
-          chmod +x /host/opt/cni/bin/headcni-daemon
+          
+          # 2. Prepare configuration in container
+          mkdir -p /tmp/headcni/config
+          mkdir -p /tmp/headcni/templates
+          
+          # Copy template files
+          cp /etc/headcni/headcni-daemon.env /tmp/headcni/config/
+          
+          # Create configuration file
+          cat > /tmp/headcni/config/daemon.yaml <<EOF
+          daemon:
+            logLevel: info
+            hostNetwork: true
+            metrics:
+              enabled: {{ .Values.config.monitoring.enabled }}
+              port: {{ .Values.config.monitoring.port }}
+              path: {{ .Values.config.monitoring.path }}
+          
+          network:
+            podCIDR:
+              base: {{ .Values.config.network.podCIDR }}
+              perNode: "/24"
+            serviceCIDR: {{ .Values.config.network.serviceCIDR }}
+            mtu: {{ .Values.config.network.mtu }}
+            enableIPv6: {{ .Values.config.network.enableIPv6 }}
+            enableNetworkPolicy: {{ .Values.config.network.enableNetworkPolicy }}
+          
+          ipam:
+            type: {{ .Values.config.ipam.type }}
+            strategy: {{ .Values.config.ipam.strategy }}
+            gcInterval: {{ .Values.config.ipam.gcInterval }}
+          
+          headscale:
+            url: {{ .Values.config.headscale.url }}
+            authKey: ""
+          
+          tailscale:
+            mode: {{ .Values.config.tailscale.mode }}
+            url: {{ .Values.config.tailscale.url }}
+            socket:
+              path: {{ .Values.config.tailscale.socket.path }}
+              name: {{ .Values.config.tailscale.socket.name }}
+            hostname:
+              prefix: {{ .Values.config.tailscale.hostname.prefix }}
+              type: {{ .Values.config.tailscale.hostname.type }}
+            mtu: {{ .Values.config.tailscale.mtu }}
+            acceptDNS: {{ .Values.config.tailscale.acceptDNS }}
+            user: {{ .Values.config.tailscale.user }}
+            tags:
+          {{- range .Values.config.tailscale.tags }}
+            - {{ . }}
+          {{- end }}
+          
+          dns:
+            magicDNS:
+              enabled: {{ .Values.config.dns.magicDNS.enabled }}
+              nameservers:
+          {{- range .Values.config.dns.magicDNS.nameservers }}
+              - {{ . }}
+          {{- end }}
+              searchDomains:
+          {{- range .Values.config.dns.magicDNS.searchDomains }}
+              - {{ . }}
+          {{- end }}
+              options:
+          {{- range .Values.config.dns.magicDNS.options }}
+              - {{ . }}
+          {{- end }}
+          EOF
+          
+          echo "HeadCNI setup completed"
         volumeMounts:
-        - name: cni-bin
+        - name: host-cni-bin
           mountPath: /host/opt/cni/bin
+        - name: headcni-config
+          mountPath: /etc/headcni
+        - name: shared-config
+          mountPath: /tmp/headcni
+        securityContext:
+          runAsNonRoot: false
+          runAsUser: 0
+          privileged: true
       containers:
       - name: headcni-daemon
         image: "{{ .Values.image.repository }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         command:
         - /opt/cni/bin/headcni-daemon
-        - --headscale-url={{ .Values.config.headscale.url }}
-        - --headscale-auth-key={{ .Values.config.headscale.authKey }}
-        - --pod-cidr={{ .Values.config.network.podCIDRBase }}
-        - --service-cidr={{ .Values.config.network.serviceCIDR }}
-        - --mtu={{ .Values.config.network.mtu }}
-        - --ipam-type={{ .Values.config.ipam.type }}
-        - --allocation-strategy={{ .Values.config.ipam.strategy }}
-        - --mode={{ .Values.config.tailscale.mode }}
-        - --interface-name={{ .Values.config.tailscale.socket_name }}
-        {{- if .Values.config.monitoring.enabled }}
-        - --metrics-port={{ .Values.config.monitoring.port }}
-        - --metrics-path={{ .Values.config.monitoring.path }}
-        {{- end }}
+        - --config=/tmp/headcni/config/daemon.yaml
+        - --log-level=info
         env:
         - name: NODE_NAME
           valueFrom:
@@ -64,6 +139,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
+        # Pod CIDR can be injected via environment variable or obtained via Kubernetes API
+        - name: POD_CIDR
+          value: "{{ .Values.config.network.podCIDR | default "" }}"
+        - name: SERVICE_CIDR
+          value: "{{ .Values.config.network.serviceCIDR | default "" }}"
+
         {{- if .Values.config.headscale.authKey }}
         - name: HEADSCALE_AUTH_KEY
           valueFrom:
@@ -72,26 +153,41 @@ spec:
               key: auth-key
         {{- end }}
         securityContext:
+          # CNI plugin needs privileged access to configure the network
           privileged: true
           capabilities:
             add:
-            - NET_ADMIN
-            - SYS_ADMIN
+            - NET_ADMIN      # Network management permissions
+            - SYS_ADMIN      # System management permissions (for network configuration)
+            - NET_RAW        # Raw network access permissions
+          allowPrivilegeEscalation: true
+          readOnlyRootFilesystem: false
+          runAsNonRoot: false
+          runAsUser: 0
         volumeMounts:
-        - name: cni-bin
-          mountPath: /opt/cni/bin
+        # CNI configuration directory - writable
         - name: cni-conf
           mountPath: /etc/cni/net.d
-        - name: tailscale-socket
+          readOnly: false
+        # HeadCNI configuration - read-only
+        - name: headcni-config
+          mountPath: /etc/headcni
+          readOnly: true
+        # Temporary configuration directory
+        - name: shared-config
+          mountPath: /tmp/headcni
+        # Tailscale runtime directory
+        - name: tailscale-runtime
           mountPath: /var/run/tailscale
+        # Tailscale data directory
+        - name: tailscale-data
+          mountPath: /var/lib/tailscale
+        # HeadCNI runtime data
+        - name: headcni-runtime
+          mountPath: /var/run/headcni
+        # HeadCNI persistent data
         - name: headcni-data
           mountPath: /var/lib/headcni
-        - name: headcni-socket
-          mountPath: /var/run/headcni
-        - name: headcni-tailscale
-          mountPath: /var/run/headcni/tailscale
-        - name: headcni-tailscale-data
-          mountPath: /var/lib/headcni/tailscale
         {{- if .Values.config.monitoring.enabled }}
         ports:
         - name: metrics
@@ -103,42 +199,59 @@ spec:
         {{- if .Values.config.monitoring.enabled }}
         livenessProbe:
           httpGet:
-            path: {{ .Values.config.monitoring.path | trimPrefix "/" }}
+            path: /health
             port: {{ .Values.config.monitoring.port }}
           initialDelaySeconds: 30
           periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: {{ .Values.config.monitoring.path | trimPrefix "/" }}
+            path: /health
             port: {{ .Values.config.monitoring.port }}
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
         {{- end }}
       volumes:
-      - name: cni-bin
-        hostPath:
-          path: /opt/cni/bin
-          type: DirectoryOrCreate
+      # CNI configuration directory
       - name: cni-conf
+        hostPath:
+          path: /etc/cni/net.d
+          type: DirectoryOrCreate
+      # HeadCNI configuration file
+      - name: headcni-config
         configMap:
           name: {{ include "headcni.fullname" . }}-config
-      - name: tailscale-socket
+      # Temporary configuration directory
+      - name: shared-config
+        emptyDir: {}
+      # Host CNI binary directory
+      - name: host-cni-bin
+        hostPath:
+          path: /opt/cni/bin
+          type: Directory
+      # Tailscale runtime directory
+      - name: tailscale-runtime
         hostPath:
           path: /var/run/tailscale
           type: DirectoryOrCreate
-      - name: headcni-data
+      # Tailscale data directory
+      - name: tailscale-data
         hostPath:
-          path: /var/lib/headcni
+          path: /var/lib/tailscale
           type: DirectoryOrCreate
-      - name: headcni-socket
+      # HeadCNI runtime directory
+      - name: headcni-runtime
         hostPath:
           path: /var/run/headcni
           type: DirectoryOrCreate
-      - name: headcni-tailscale
+      # HeadCNI persistent data directory
+      - name: headcni-data
         hostPath:
-          path: /var/run/headcni/tailscale
-          type: DirectoryOrCreate
-      - name: headcni-tailscale-data
-        hostPath:
-          path: /var/lib/headcni/tailscale
+          path: /var/lib/headcni
           type: DirectoryOrCreate
       {{- with .Values.nodeSelector }}
       nodeSelector:

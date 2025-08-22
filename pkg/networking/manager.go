@@ -2,13 +2,11 @@
 package networking
 
 import (
-	"encoding/json"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"strings"
-	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
@@ -17,9 +15,8 @@ import (
 
 // Config 定义网络管理器配置
 type Config struct {
-	TailscaleSocket string
-	MTU             int
-	EnableIPv6      bool
+	MTU        int
+	EnableIPv6 bool
 }
 
 // NetworkManager 是网络管理器
@@ -30,7 +27,7 @@ type NetworkManager struct {
 // NewNetworkManager 创建新的网络管理器
 func NewNetworkManager(config *Config) (*NetworkManager, error) {
 	if config.MTU == 0 {
-		config.MTU = 1420 // 默认 MTU，考虑 Tailscale 封装开销
+		config.MTU = 1420
 	}
 
 	return &NetworkManager{
@@ -40,102 +37,205 @@ func NewNetworkManager(config *Config) (*NetworkManager, error) {
 
 // CreateVethPair 创建 veth pair
 func (nm *NetworkManager) CreateVethPair(netnsPath, containerIfName, hostIfName string) error {
-	// 创建 veth pair
-	hostVeth := &netlink.Veth{
-		LinkAttrs: netlink.LinkAttrs{
-			Name: hostIfName,
-			MTU:  nm.config.MTU,
-		},
-		PeerName: containerIfName,
+	// 如果同名的veth已经存在了，删除
+	if oldHostVeth, err := netlink.LinkByName(hostIfName); err == nil {
+		if err = netlink.LinkDel(oldHostVeth); err != nil {
+			return fmt.Errorf("failed to delete old hostVeth %s: %v", hostIfName, err)
+		}
 	}
 
-	if err := netlink.LinkAdd(hostVeth); err != nil {
-		return fmt.Errorf("failed to create veth pair: %v", err)
+	// 在容器网络命名空间中创建veth pair
+	return ns.WithNetNSPath(netnsPath, func(hostNS ns.NetNS) error {
+		veth := &netlink.Veth{
+			LinkAttrs: netlink.LinkAttrs{
+				Name: containerIfName,
+				MTU:  nm.config.MTU,
+			},
+			PeerName: hostIfName,
+		}
+
+		// 创建veth pair
+		if err := netlink.LinkAdd(veth); err != nil {
+			return fmt.Errorf("failed to create veth pair: %v", err)
+		}
+
+		// 获取宿主机端的veth
+		hostVeth, err := netlink.LinkByName(hostIfName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup %s: %v", hostIfName, err)
+		}
+
+		// 设置宿主机端veth的MAC地址
+		defaultHostVethMac, _ := net.ParseMAC("EE:EE:EE:EE:EE:EE")
+		if err = netlink.LinkSetHardwareAddr(hostVeth, defaultHostVethMac); err != nil {
+			klog.V(4).Infof("failed to Set MAC of %s: %v. Using kernel generated MAC.", hostIfName, err)
+		}
+
+		// 启用宿主机端的veth
+		if err = netlink.LinkSetUp(hostVeth); err != nil {
+			return fmt.Errorf("failed to set %s up: %v", hostIfName, err)
+		}
+
+		// 获取容器端的veth
+		contVeth, err := netlink.LinkByName(containerIfName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup %s: %v", containerIfName, err)
+		}
+
+		// 启用容器端的veth
+		if err = netlink.LinkSetUp(contVeth); err != nil {
+			return fmt.Errorf("failed to set %s up: %v", containerIfName, err)
+		}
+
+		// 将宿主机端veth移动到宿主机网络命名空间
+		if err = netlink.LinkSetNsFd(hostVeth, int(hostNS.Fd())); err != nil {
+			return fmt.Errorf("failed to move veth to host netns: %v", err)
+		}
+
+		klog.V(4).Infof("Created veth pair: %s (host) <-> %s (container)",
+			hostIfName, containerIfName)
+
+		return nil
+	})
+}
+
+// SetupVethProxyARP 设置veth的ARP代理
+func (nm *NetworkManager) SetupVethProxyARP(hostVethName string) error {
+	// 设置ARP代理
+	if err := nm.writeProcSys(fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/proxy_arp", hostVethName), "1"); err != nil {
+		return fmt.Errorf("failed to set net.ipv4.conf.%s.proxy_arp=1: %v", hostVethName, err)
 	}
 
-	// 获取 peer 接口（容器端）
-	containerVeth, err := netlink.LinkByName(containerIfName)
-	if err != nil {
-		// 清理已创建的 host veth
-		netlink.LinkDel(hostVeth)
-		return fmt.Errorf("failed to find container veth: %v", err)
-	}
-
-	// 将容器端接口移动到目标网络命名空间
-	containerNS, err := ns.GetNS(netnsPath)
-	if err != nil {
-		netlink.LinkDel(hostVeth)
-		return fmt.Errorf("failed to get container netns: %v", err)
-	}
-	defer containerNS.Close()
-
-	if err := netlink.LinkSetNsFd(containerVeth, int(containerNS.Fd())); err != nil {
-		netlink.LinkDel(hostVeth)
-		return fmt.Errorf("failed to move veth to container netns: %v", err)
-	}
-
-	klog.V(4).Infof("Created veth pair: %s (host) <-> %s (container)",
-		hostIfName, containerIfName)
-
+	klog.V(4).Infof("Set proxy_arp=1 for %s", hostVethName)
 	return nil
 }
 
-// GetTailscaleIP 获取 Tailscale IP
-func (nm *NetworkManager) GetTailscaleIP() (net.IP, error) {
-	// 从 tailscale status 获取本机 IP
-	cmd := exec.Command("tailscale", "ip", "-4")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get tailscale IP: %v", err)
-	}
+// SetupPodNetwork 配置Pod网络
+func (nm *NetworkManager) SetupPodNetwork(netnsPath, containerIfName string, podIP net.IP, gateway net.IP) error {
+	return ns.WithNetNSPath(netnsPath, func(hostNS ns.NetNS) error {
+		// 获取容器端veth
+		contVeth, err := netlink.LinkByName(containerIfName)
+		if err != nil {
+			return fmt.Errorf("failed to lookup %s: %v", containerIfName, err)
+		}
 
-	ipStr := strings.TrimSpace(string(output))
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return nil, fmt.Errorf("invalid IP address: %s", ipStr)
-	}
+		// 配置IP地址
+		addr := &netlink.Addr{
+			IPNet: &net.IPNet{
+				IP:   podIP,
+				Mask: net.CIDRMask(32, 32), // /32 主机路由
+			},
+		}
 
-	return ip, nil
+		if err = netlink.AddrAdd(contVeth, addr); err != nil {
+			return fmt.Errorf("failed to add IP addr to %s: %v", containerIfName, err)
+		}
+
+		// 添加网关路由（确保网关可达）
+		defaultGwIPNet := &net.IPNet{IP: gateway, Mask: net.CIDRMask(32, 32)}
+		if err := netlink.RouteAdd(
+			&netlink.Route{
+				LinkIndex: contVeth.Attrs().Index,
+				Scope:     netlink.SCOPE_LINK,
+				Dst:       defaultGwIPNet,
+			},
+		); err != nil {
+			return fmt.Errorf("failed to add gateway route: %v", err)
+		}
+
+		// 添加默认路由
+		_, IPv4AllNet, _ := net.ParseCIDR("0.0.0.0/0")
+		defaultRoute := &netlink.Route{
+			LinkIndex: contVeth.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       IPv4AllNet,
+			Gw:        gateway,
+		}
+
+		if err = netlink.RouteAdd(defaultRoute); err != nil {
+			return fmt.Errorf("failed to add default route: %v", err)
+		}
+
+		klog.V(4).Infof("Configured pod network: IP=%s, Gateway=%s", podIP.String(), gateway.String())
+		return nil
+	})
 }
 
-// GetTailscaleStatus 获取 Tailscale 状态
-func (nm *NetworkManager) GetTailscaleStatus() (*TailscaleStatus, error) {
-	cmd := exec.Command("tailscale", "status", "--json")
-	output, err := cmd.Output()
+// SetupHostRoute 配置宿主机路由
+func (nm *NetworkManager) SetupHostRoute(hostVethName string, podIP net.IP) error {
+	// 获取宿主机上的veth接口
+	hostVeth, err := netlink.LinkByName(hostVethName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get tailscale status: %v", err)
+		return fmt.Errorf("failed to find host veth %s: %v", hostVethName, err)
 	}
 
-	var status TailscaleStatus
-	if err := json.Unmarshal(output, &status); err != nil {
-		return nil, fmt.Errorf("failed to parse tailscale status: %v", err)
+	// 启用宿主机veth接口
+	if err := netlink.LinkSetUp(hostVeth); err != nil {
+		return fmt.Errorf("failed to set host veth up: %v", err)
 	}
 
-	return &status, nil
+	// 添加路由：Pod IP -> host veth
+	route := &netlink.Route{
+		LinkIndex: hostVeth.Attrs().Index,
+		Scope:     netlink.SCOPE_LINK,
+		Dst: &net.IPNet{
+			IP:   podIP,
+			Mask: net.CIDRMask(32, 32), // /32 主机路由
+		},
+	}
+
+	if err := netlink.RouteAdd(route); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("failed to add host route for pod IP: %v", err)
+	}
+
+	klog.V(4).Infof("Added host route: %s -> %s", podIP.String(), hostVethName)
+	return nil
 }
 
-// CheckTailscaleConnectivity 检查 Tailscale 连接性
-func (nm *NetworkManager) CheckTailscaleConnectivity() error {
-	status, err := nm.GetTailscaleStatus()
+// CleanupHostRoute 清理宿主机路由
+func (nm *NetworkManager) CleanupHostRoute(hostVethName string) error {
+	// 尝试删除相关路由（如果接口还存在的话）
+	hostVeth, err := netlink.LinkByName(hostVethName)
+	if err != nil {
+		// 接口可能已经被删除，这是正常的
+		return nil
+	}
+
+	// 获取与该接口相关的路由并删除
+	routes, err := netlink.RouteList(hostVeth, netlink.FAMILY_V4)
 	if err != nil {
 		return err
 	}
 
-	if status.BackendState != "Running" {
-		return fmt.Errorf("tailscale not running, state: %s", status.BackendState)
+	for _, route := range routes {
+		if err := netlink.RouteDel(&route); err != nil {
+			klog.V(4).Infof("Failed to delete route %v: %v", route, err)
+		}
 	}
 
-	if !status.Self.Online {
-		return fmt.Errorf("tailscale offline")
+	return nil
+}
+
+// VethNameForWorkload 生成veth名称
+func (nm *NetworkManager) VethNameForWorkload(namespace, podname string) string {
+	// A SHA1 is always 20 bytes long, and so is sufficient for generating the
+	// veth name and mac addr.
+	h := sha1.New()
+	h.Write([]byte(fmt.Sprintf("%s.%s", namespace, podname)))
+	return fmt.Sprintf("veth%s", hex.EncodeToString(h.Sum(nil))[:11])
+}
+
+// writeProcSys 写入proc文件系统
+func (nm *NetworkManager) writeProcSys(path, value string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
 	}
+	defer f.Close()
 
-	if len(status.Self.TailscaleIPs) == 0 {
-		return fmt.Errorf("no tailscale IP assigned")
+	if _, err = f.WriteString(value); err != nil {
+		return err
 	}
-
-	klog.V(4).Infof("Tailscale connectivity OK, IP: %s",
-		strings.Join(status.Self.TailscaleIPs, ","))
-
 	return nil
 }
 
@@ -216,136 +316,4 @@ func (nm *NetworkManager) DeleteInterface(interfaceName string) error {
 
 	klog.V(4).Infof("Deleted interface: %s", interfaceName)
 	return nil
-}
-
-// StartTailscaleService 启动 Tailscale 服务
-func (nm *NetworkManager) StartTailscaleService(interfaceName, nodeKey, headscaleURL string) error {
-	// 检查接口是否已存在
-	if nm.InterfaceExists(interfaceName) {
-		klog.V(4).Infof("Interface %s already exists", interfaceName)
-		return nil
-	}
-
-	// 创建专用的 tailscaled 配置目录
-	configDir := fmt.Sprintf("/var/lib/headcni/tailscale/%s", interfaceName)
-	if err := exec.Command("mkdir", "-p", configDir).Run(); err != nil {
-		return fmt.Errorf("failed to create config directory: %v", err)
-	}
-
-	// 创建 socket 目录
-	socketDir := fmt.Sprintf("/var/run/headcni/tailscale")
-	if err := exec.Command("mkdir", "-p", socketDir).Run(); err != nil {
-		return fmt.Errorf("failed to create socket directory: %v", err)
-	}
-
-	// 启动专用的 tailscaled 进程
-	cmd := exec.Command("tailscaled",
-		"--state", fmt.Sprintf("%s/tailscaled.state", configDir),
-		"--socket", fmt.Sprintf("%s/%s.sock", socketDir, interfaceName),
-		"--tun", interfaceName,
-		"--port", "0", // 随机端口
-		"--verbose", "1",
-	)
-
-	// 设置环境变量避免与系统 Tailscale 冲突
-	cmd.Env = append(os.Environ(),
-		"TAILSCALE_USE_WIPEOUT=true",
-		"TAILSCALE_DEBUG=1",
-	)
-
-	// 启动进程
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start tailscaled: %v", err)
-	}
-
-	// 等待服务启动
-	time.Sleep(3 * time.Second)
-
-	// 检查进程是否还在运行
-	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-		return fmt.Errorf("tailscaled process exited unexpectedly")
-	}
-
-	// 使用 nodekey 连接到 Headscale
-	upCmd := exec.Command("tailscale", "up",
-		"--authkey", nodeKey,
-		"--hostname", fmt.Sprintf("headcni-%s", interfaceName),
-		"--socket", fmt.Sprintf("%s/%s.sock", socketDir, interfaceName),
-		"--accept-dns=false",
-		"--accept-routes=true",
-		"--advertise-routes", "10.244.0.0/16", // 根据实际 Pod CIDR 调整
-	)
-
-	if err := upCmd.Run(); err != nil {
-		// 清理进程
-		cmd.Process.Kill()
-		return fmt.Errorf("failed to connect to headscale: %v", err)
-	}
-
-	klog.V(4).Infof("Started tailscale service for interface: %s (PID: %d)", interfaceName, cmd.Process.Pid)
-	return nil
-}
-
-// StopTailscaleService 停止 Tailscale 服务
-func (nm *NetworkManager) StopTailscaleService(interfaceName string) error {
-	socketPath := fmt.Sprintf("/var/run/headcni/tailscale/%s.sock", interfaceName)
-
-	// 停止 tailscale 连接
-	downCmd := exec.Command("tailscale", "down",
-		"--socket", socketPath,
-	)
-	downCmd.Run() // 忽略错误
-
-	// 查找并停止相关的 tailscaled 进程
-	// 使用 ps 查找包含特定 socket 的 tailscaled 进程
-	psCmd := exec.Command("ps", "aux")
-	output, err := psCmd.Output()
-	if err == nil {
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "tailscaled") && strings.Contains(line, interfaceName) {
-				fields := strings.Fields(line)
-				if len(fields) > 1 {
-					pid := fields[1]
-					killCmd := exec.Command("kill", "-TERM", pid)
-					killCmd.Run()
-					klog.V(4).Infof("Sent TERM signal to tailscaled process: %s", pid)
-				}
-			}
-		}
-	}
-
-	// 等待进程退出
-	time.Sleep(2 * time.Second)
-
-	// 强制杀死残留进程
-	exec.Command("pkill", "-f", fmt.Sprintf("tailscaled.*%s", interfaceName)).Run()
-
-	// 清理 socket 文件
-	exec.Command("rm", "-f", socketPath).Run()
-
-	klog.V(4).Infof("Stopped tailscale service for interface: %s", interfaceName)
-	return nil
-}
-
-// TailscaleStatus 表示 Tailscale 状态
-type TailscaleStatus struct {
-	BackendState string `json:"BackendState"`
-	Self         struct {
-		ID           string   `json:"ID"`
-		HostName     string   `json:"HostName"`
-		TailscaleIPs []string `json:"TailscaleIPs"`
-		Online       bool     `json:"Online"`
-	} `json:"Self"`
-	Peers map[string]struct {
-		ID            string   `json:"ID"`
-		HostName      string   `json:"HostName"`
-		TailscaleIPs  []string `json:"TailscaleIPs"`
-		Online        bool     `json:"Online"`
-		LastSeen      string   `json:"LastSeen"`
-		PrimaryRoutes struct {
-			Advertised []string `json:"advertised"`
-			Enabled    []string `json:"enabled"`
-		} `json:"PrimaryRoutes"`
-	} `json:"Peers"`
 }

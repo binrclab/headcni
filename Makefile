@@ -11,7 +11,8 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GO := go
 GOOS := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
-GOFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME) -X main.GitCommit=$(GIT_COMMIT)"
+BUILD_DATE := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+GOFLAGS := -ldflags "-X github.com/binrclab/headcni/cmd/headcni-daemon/command.Version=$(VERSION) -X github.com/binrclab/headcni/cmd/headcni-daemon/command.BuildDate=$(BUILD_DATE) -X github.com/binrclab/headcni/cmd/headcni-daemon/command.GitCommit=$(GIT_COMMIT) -s -w"
 
 # 目录定义
 BIN_DIR := bin
@@ -84,10 +85,20 @@ help:
 	@echo "  upgrade        - 升级系统"
 	@echo "  package        - 打包发布"
 	@echo ""
+	@echo "Docker 目标:"
+	@echo "  docker         - 构建 Docker 镜像"
+	@echo "  docker-pull    - 拉取 Docker 镜像"
+	@echo "  docker-login   - Docker Hub 认证"
+	@echo "  docker-push    - 推送 Docker 镜像到注册表 (需要认证)"
+	@echo "  docker-clean   - 清理 Docker 镜像"
+	@echo ""
 	@echo "变量:"
 	@echo "  VERSION=$(VERSION)"
 	@echo "  BUILD_TIME=$(BUILD_TIME)"
 	@echo "  GIT_COMMIT=$(GIT_COMMIT)"
+	@echo "  DOCKER_USERNAME - Docker Hub 用户名 (用于认证)"
+	@echo "  DOCKER_PASSWORD - Docker Hub 密码 (用于认证)"
+	@echo "  DOCKER_TOKEN    - Docker Hub 访问令牌 (用于认证)"
 
 # 创建必要的目录
 $(BIN_DIR):
@@ -112,7 +123,7 @@ build-ipam: $(BIN_DIR)
 .PHONY: build-main
 build-main: $(BIN_DIR)
 	@echo "构建主 CNI 插件..."
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni ./cmd/headcni/main.go
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni ./cmd/headcni/
 
 # 可选组件构建目标
 .PHONY: build-daemon
@@ -427,11 +438,110 @@ clean-all: clean
 	sudo rm -rf $(DATA_DIR)
 	@echo "清理完成"
 
+# Docker 相关目标
+.PHONY: docker
+docker: 
+	@echo "构建 Docker 镜像..."
+	docker build -t binrc/headcni:$(VERSION) .
+	docker tag binrc/headcni:$(VERSION) binrc/headcni:latest
+	@echo "Docker 镜像构建完成: binrc/headcni:$(VERSION), binrc/headcni:latest"
+
+.PHONY: docker-pull
+docker-pull:
+	@echo "拉取 Docker 镜像..."
+	docker pull binrc/headcni:$(VERSION)
+	docker pull binrc/headcni:latest
+	@echo "Docker 镜像拉取完成: binrc/headcni:$(VERSION), binrc/headcni:latest"
+
+.PHONY: docker-push
+docker-push: docker
+	@echo "推送 Docker 镜像..."
+	@echo "注意: 推送需要 Docker Hub 认证"
+	@echo "请确保已登录: docker login"
+	@echo "或者使用: docker login -u YOUR_USERNAME -p YOUR_PASSWORD"
+	@echo ""
+	@if ! docker info > /dev/null 2>&1; then \
+		echo "错误: Docker 未运行或无法连接"; \
+		exit 1; \
+	fi
+	@if ! docker images | grep -q "binrc/headcni"; then \
+		echo "错误: 未找到 binrc/headcni 镜像，请先运行 make docker"; \
+		exit 1; \
+	fi
+	docker push binrc/headcni:$(VERSION)
+	docker push binrc/headcni:latest
+	@echo "Docker 镜像推送完成: binrc/headcni:$(VERSION), binrc/headcni:latest"
+
+.PHONY: docker-login
+docker-login:
+	@echo "Docker Hub 认证..."
+	@if [ -n "$(DOCKER_USERNAME)" ] && [ -n "$(DOCKER_PASSWORD)" ]; then \
+		echo "使用环境变量进行认证..."; \
+		docker login -u "$(DOCKER_USERNAME)" -p "$(DOCKER_PASSWORD)"; \
+	elif [ -n "$(DOCKER_TOKEN)" ]; then \
+		echo "使用 Docker 令牌进行认证..."; \
+		echo "$(DOCKER_TOKEN)" | docker login -u "$(DOCKER_USERNAME)" --password-stdin; \
+	else \
+		echo "请输入您的 Docker Hub 用户名和密码:"; \
+		read -p "用户名: " username; \
+		read -s -p "密码: " password; \
+		echo ""; \
+		docker login -u "$$username" -p "$$password"; \
+	fi
+	@echo "认证完成"
+
+.PHONY: docker-clean
+docker-clean:
+	@echo "清理 Docker 镜像..."
+	docker rmi binrc/headcni:$(VERSION) binrc/headcni:latest 2>/dev/null || true
+	@echo "Docker 镜像清理完成"
+
 # 显示版本信息
 .PHONY: version
 version:
 	@echo "HeadCNI $(VERSION)"
-	@echo "Build Time: $(BUILD_TIME)"
+	@echo "Build Date: $(BUILD_DATE)"
 	@echo "Git Commit: $(GIT_COMMIT)"
 	@echo "Go Version: $(shell go version)"
-	@echo "OS/Arch: $(GOOS)/$(GOARCH)" 
+	@echo "OS/Arch: $(GOOS)/$(GOARCH)"
+
+# 测试命令功能
+.PHONY: test-commands
+test-commands: build
+	@echo "测试命令功能..."
+	@echo "1. 测试版本命令:"
+	./$(BIN_DIR)/headcni-daemon version
+	@echo ""
+	@echo "2. 测试健康检查命令:"
+	./$(BIN_DIR)/headcni-daemon health --timeout=10s
+	@echo ""
+	@echo "3. 测试配置显示命令:"
+	./$(BIN_DIR)/headcni-daemon config show
+	@echo ""
+	@echo "4. 测试帮助命令:"
+	./$(BIN_DIR)/headcni-daemon --help
+
+# 运行修复后的命令
+.PHONY: run-version
+run-version: build
+	@echo "运行版本命令:"
+	./$(BIN_DIR)/headcni-daemon version
+
+.PHONY: run-health
+run-health: build
+	@echo "运行健康检查:"
+	./$(BIN_DIR)/headcni-daemon health --timeout=30s
+
+.PHONY: run-config-validate
+run-config-validate: build
+	@echo "运行配置验证:"
+	@if [ -f chart/values.yaml ]; then \
+		./$(BIN_DIR)/headcni-daemon config validate --config=chart/values.yaml; \
+	else \
+		echo "配置文件 chart/values.yaml 不存在，跳过验证"; \
+	fi
+
+.PHONY: run-config-show
+run-config-show: build
+	@echo "运行配置显示:"
+	./$(BIN_DIR)/headcni-daemon config show 

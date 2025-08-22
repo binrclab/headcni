@@ -429,3 +429,76 @@ func randomInt(min, max int) int {
 	// 简单的随机数生成（生产环境应使用 crypto/rand）
 	return min + int(time.Now().UnixNano()%int64(max-min))
 }
+
+// GetLocalPoolCIDR 获取本地池的CIDR
+func (m *IPAMManager) GetLocalPoolCIDR() string {
+	if m.localPool != nil && m.localPool.cidr != nil {
+		return m.localPool.cidr.String()
+	}
+	return ""
+}
+
+// GetLocalPool 获取本地池信息
+func (m *IPAMManager) GetLocalPool() *LocalIPPool {
+	return m.localPool
+}
+
+// GetLocalPoolStats 获取本地池统计信息
+func (m *IPAMManager) GetLocalPoolStats() map[string]interface{} {
+	if m.localPool == nil {
+		return nil
+	}
+
+	m.localPool.mutex.RLock()
+	defer m.localPool.mutex.RUnlock()
+
+	// 计算可用IP数量
+	totalIPs := 0
+	allocatedIPs := len(m.localPool.allocatedIPs)
+	reservedIPs := len(m.localPool.reservedIPs)
+
+	// 计算总IP数量（简化计算）
+	if m.localPool.cidr != nil {
+		ones, bits := m.localPool.cidr.Mask.Size()
+		totalIPs = 1 << (bits - ones)
+	}
+
+	return map[string]interface{}{
+		"cidr":          m.localPool.cidr.String(),
+		"total_ips":     totalIPs,
+		"allocated_ips": allocatedIPs,
+		"reserved_ips":  reservedIPs,
+		"available_ips": totalIPs - allocatedIPs - reservedIPs,
+		"next_ip":       m.localPool.nextIP.String(),
+	}
+}
+
+// GetIPByContainerID 根据容器ID获取分配的IP
+func (m *IPAMManager) GetIPByContainerID(containerID string) net.IP {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	// 遍历已分配的IP，查找匹配的容器ID
+	for _, allocation := range m.allocatedIPs {
+		if allocation.ContainerID == containerID {
+			return allocation.IP
+		}
+	}
+
+	return nil
+}
+
+// GetAllocationByContainerID 根据容器ID获取完整的分配信息
+func (m *IPAMManager) GetAllocationByContainerID(containerID string) *IPAllocation {
+	m.mutex.RLock()
+	defer m.mutex.RUnlock()
+
+	// 遍历已分配的IP，查找匹配的容器ID
+	for _, allocation := range m.allocatedIPs {
+		if allocation.ContainerID == containerID {
+			return allocation
+		}
+	}
+
+	return nil
+}

@@ -1,28 +1,29 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
-	"github.com/containernetworking/cni/pkg/types/100"
 	"github.com/containernetworking/cni/pkg/version"
-
-	"github.com/binrclab/headcni/pkg/ipam"
+	bv "github.com/containernetworking/plugins/pkg/utils/buildversion"
 )
+
+// IPAMRange 表示 IPAM 范围配置
+type IPAMRange struct {
+	Subnet  string `json:"subnet,omitempty"`
+	Gateway string `json:"gateway,omitempty"`
+}
 
 // IPAMConfig 定义IPAM配置
 type IPAMConfig struct {
-	Type               string         `json:"type"`
-	Subnet             string         `json:"subnet"`
-	RangeStart         string         `json:"rangeStart,omitempty"`
-	RangeEnd           string         `json:"rangeEnd,omitempty"`
-	Gateway            string         `json:"gateway,omitempty"`
-	AllocationStrategy string         `json:"allocation_strategy,omitempty"`
-	Routes             []*types.Route `json:"routes,omitempty"`
+	Type               string        `json:"type"`
+	Ranges             [][]IPAMRange `json:"ranges,omitempty"`
+	DataDir            string        `json:"dataDir,omitempty"`
+	AllocationStrategy string        `json:"allocation_strategy,omitempty"`
 }
 
 // NetConf 定义网络配置
@@ -32,109 +33,88 @@ type NetConf struct {
 }
 
 func main() {
-	skel.PluginMain(cmdAdd, cmdCheck, cmdDel, version.All, "headcni-ipam")
+	skel.PluginMainFuncs(skel.CNIFuncs{
+		Add:   cmdAdd,
+		Check: cmdCheck,
+		Del:   cmdDel,
+	}, version.All, bv.BuildString("headcni-ipam"))
 }
 
-func cmdAdd(args *skel.CmdArgs) error {
-	conf, err := loadNetConf(args.StdinData)
-	if err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
+// PodInfo 表示 Pod 信息
+type PodInfo struct {
+	Namespace string
+	Name      string
+	UID       string
+	// 添加与主插件一致的字段
+	containerID string
+}
+
+// parsePodInfo 解析 Pod 信息
+func parsePodInfo(cniArgs string) (*PodInfo, error) {
+	// 解析 CNI_ARGS 格式：IgnoreUnknown=1;K8S_POD_NAMESPACE=default;K8S_POD_NAME=pod-name;...
+	args := make(map[string]string)
+
+	for _, arg := range strings.Split(cniArgs, ";") {
+		parts := strings.SplitN(arg, "=", 2)
+		if len(parts) == 2 {
+			args[parts[0]] = parts[1]
+		}
+	}
+
+	namespace := args["K8S_POD_NAMESPACE"]
+	name := args["K8S_POD_NAME"]
+	uid := args["K8S_POD_UID"]
+	containerID := args["K8S_POD_INFRA_CONTAINER_ID"]
+
+	if namespace == "" || name == "" {
+		return nil, fmt.Errorf("missing required pod info in CNI args")
+	}
+
+	return &PodInfo{
+		Namespace:   namespace,
+		Name:        name,
+		UID:         uid,
+		containerID: containerID,
+	}, nil
+}
+
+// getSubnetConfig 从 IPAM 配置中获取子网和网关信息
+func getSubnetConfig(ipamConfig *IPAMConfig) (*net.IPNet, net.IP, error) {
+	var subnetStr string
+	var gatewayStr string
+
+	// 从 ranges 配置中获取
+	if len(ipamConfig.Ranges) > 0 && len(ipamConfig.Ranges[0]) > 0 {
+		rangeConfig := ipamConfig.Ranges[0][0]
+		subnetStr = rangeConfig.Subnet
+		gatewayStr = rangeConfig.Gateway
+	}
+
+	if subnetStr == "" {
+		return nil, nil, fmt.Errorf("no subnet specified in IPAM configuration")
 	}
 
 	// 解析子网
-	_, subnet, err := net.ParseCIDR(conf.IPAM.Subnet)
+	_, subnet, err := net.ParseCIDR(subnetStr)
 	if err != nil {
-		return fmt.Errorf("invalid subnet %s: %v", conf.IPAM.Subnet, err)
+		return nil, nil, fmt.Errorf("invalid subnet %s: %v", subnetStr, err)
 	}
 
-	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
-	if err != nil {
-		return fmt.Errorf("failed to create IPAM manager: %v", err)
+	// 解析网关
+	var gateway net.IP
+	if gatewayStr != "" {
+		gateway = net.ParseIP(gatewayStr)
+		if gateway == nil {
+			return nil, nil, fmt.Errorf("invalid gateway %s", gatewayStr)
+		}
+	} else {
+		// 如果没有指定网关，使用子网的第一个 IP
+		gateway = make(net.IP, len(subnet.IP))
+		copy(gateway, subnet.IP)
+		gateway[len(gateway)-1] = 1
 	}
 
-	// 分配IP
-	allocation, err := manager.AllocateIP(context.Background(), "default", args.ContainerID, args.ContainerID)
-	if err != nil {
-		return fmt.Errorf("failed to allocate IP: %v", err)
-	}
-
-	// 构造结果
-	result := &types100.Result{
-		CNIVersion: types100.ImplementedSpecVersion,
-		IPs: []*types100.IPConfig{
-			{
-				Address: net.IPNet{
-					IP:   allocation.IP,
-					Mask: subnet.Mask,
-				},
-				Gateway: net.ParseIP(conf.IPAM.Gateway),
-			},
-		},
-		Routes: conf.IPAM.Routes,
-	}
-
-	return types.PrintResult(result, conf.CNIVersion)
-}
-
-func cmdDel(args *skel.CmdArgs) error {
-	conf, err := loadNetConf(args.StdinData)
-	if err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
-	}
-
-	// 解析子网
-	_, subnet, err := net.ParseCIDR(conf.IPAM.Subnet)
-	if err != nil {
-		return fmt.Errorf("invalid subnet %s: %v", conf.IPAM.Subnet, err)
-	}
-
-	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
-	if err != nil {
-		return fmt.Errorf("failed to create IPAM manager: %v", err)
-	}
-
-	// 释放IP
-	err = manager.ReleaseIP(context.Background(), "default", args.ContainerID)
-	if err != nil {
-		return fmt.Errorf("failed to release IP: %v", err)
-	}
-
-	return nil
-}
-
-func cmdCheck(args *skel.CmdArgs) error {
-	// 检查IP是否仍然分配
-	conf, err := loadNetConf(args.StdinData)
-	if err != nil {
-		return fmt.Errorf("failed to load netconf: %v", err)
-	}
-
-	// 解析子网
-	_, subnet, err := net.ParseCIDR(conf.IPAM.Subnet)
-	if err != nil {
-		return fmt.Errorf("invalid subnet %s: %v", conf.IPAM.Subnet, err)
-	}
-
-	// 创建IPAM管理器
-	manager, err := ipam.NewIPAMManager("headcni-daemon", subnet)
-	if err != nil {
-		return fmt.Errorf("failed to create IPAM manager: %v", err)
-	}
-
-	// 检查IP分配状态
-	allocation, err := manager.AllocateIP(context.Background(), "default", args.ContainerID, args.ContainerID)
-	if err != nil {
-		return fmt.Errorf("IP allocation check failed: %v", err)
-	}
-
-	// 验证IP是否在子网范围内
-	if !subnet.Contains(allocation.IP) {
-		return fmt.Errorf("allocated IP %s is not in subnet %s", allocation.IP.String(), subnet.String())
-	}
-
-	return nil
+	return subnet, gateway, nil
 }
 
 func loadNetConf(bytes []byte) (*NetConf, error) {
@@ -145,10 +125,6 @@ func loadNetConf(bytes []byte) (*NetConf, error) {
 
 	if conf.IPAM == nil {
 		return nil, fmt.Errorf("IPAM configuration is required")
-	}
-
-	if conf.IPAM.Type == "" {
-		conf.IPAM.Type = "headcni-ipam"
 	}
 
 	return conf, nil

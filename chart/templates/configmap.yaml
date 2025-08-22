@@ -6,87 +6,49 @@ metadata:
   labels:
     {{- include "headcni.labels" . | nindent 4 }}
 data:
-  # 使用 host-local IPAM 的配置
-  10-headcni.conflist: |
-    {
-      "cniVersion": "1.0.0",
-      "name": "tailscale-cni",
-      "type": "headcni",
-      
-      "headscale_url": "{{ .Values.config.headscale.url }}",
-      "tailscale_socket": "/var/run/tailscale/tailscaled.sock",
-      
-      "pod_cidr": "{{ .Values.config.network.podCIDRBase | replace "/16" "/24" }}",
-      "service_cidr": "{{ .Values.config.network.serviceCIDR }}",
-      
-      "ipam": {
-        "type": "{{ .Values.config.ipam.type }}",
-        "subnet": "{{ .Values.config.network.podCIDRBase | replace "/16" "/24" }}",
-        "gateway": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}",
-        "allocation_strategy": "{{ .Values.config.ipam.strategy }}"
-      },
-      
-      "magic_dns": {
-        "enable": true,
-        "base_domain": "cluster.local",
-        "nameservers": [{{- range $i, $ns := .Values.config.magic_dns.nameservers }}{{- if $i }}, {{- end }}"{{ $ns }}"{{- end }}],
-        "search_domains": [{{- range $i, $domain := .Values.config.magic_dns.searchDomains }}{{- if $i }}, {{- end }}"{{ $domain }}"{{- end }}]
-      },
-      
-      "mtu": {{ .Values.config.network.mtu }},
-      "enable_ipv6": {{ .Values.config.network.enableIPv6 | default false }},
-      "enable_network_policy": {{ .Values.config.network.enableNetworkPolicy | default true }}
-    }
+  # Basic configuration
+  HEADSCALE_URL: {{ .Values.config.headscale.url | quote }}
+  TAILSCALE_MODE: {{ .Values.config.tailscale.mode | quote }}
+  TAILSCALE_URL: {{ .Values.config.tailscale.url | quote }}
+  TAILSCALE_MTU: {{ .Values.config.tailscale.mtu | quote }}
+  TAILSCALE_ACCEPT_DNS: {{ .Values.config.tailscale.acceptDNS | quote }}
   
-  # 使用 headcni-ipam 的配置
-  10-headcni-ipam.conflist: |
-    {
-      "cniVersion": "1.0.0",
-      "name": "headcni",
-      "type": "headcni",
-      
-      "headscale_url": "{{ .Values.config.headscale.url }}",
-      "tailscale_socket": "/var/run/tailscale/tailscaled.sock",
-      
-      "pod_cidr": "{{ .Values.config.network.podCIDRBase | replace "/16" "/24" }}",
-      "service_cidr": "{{ .Values.config.network.serviceCIDR }}",
-      
-      "ipam": {
-        "type": "headcni-ipam",
-        "subnet": "{{ .Values.config.network.podCIDRBase | replace "/16" "/24" }}",
-        "gateway": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}",
-        "allocation_strategy": "{{ .Values.config.ipam.strategy }}",
-        "routes": [
-          {
-            "dst": "0.0.0.0/0",
-            "gw": "{{ .Values.config.network.podCIDRBase | replace "/16" ".1" | replace "/24" ".1" }}"
-          }
-        ]
-      },
-      
-      "magic_dns": {
-        "enable": true,
-        "base_domain": "cluster.local",
-        "nameservers": [{{- range $i, $ns := .Values.config.magic_dns.nameservers }}{{- if $i }}, {{- end }}"{{ $ns }}"{{- end }}],
-        "search_domains": [{{- range $i, $domain := .Values.config.magic_dns.searchDomains }}{{- if $i }}, {{- end }}"{{ $domain }}"{{- end }}]
-      },
-      
-      "mtu": {{ .Values.config.network.mtu }},
-      "enable_ipv6": {{ .Values.config.network.enableIPv6 | default false }},
-      "enable_network_policy": {{ .Values.config.network.enableNetworkPolicy | default true }}
-    }
+  # Tailscale socket configuration
+  TAILSCALE_SOCKET_NAME: {{ .Values.config.tailscale.socket.name | quote }}
+  TAILSCALE_SOCKET_PATH: {{ .Values.config.tailscale.socket.path | quote }}
   
-  # 环境变量配置文件
-  headcni.env: |
-    # Headscale 配置
-    HEADSCALE_URL={{ .Values.config.headscale.url }}
-    TAILSCALE_SOCKET={{ .Values.config.tailscale.socket | default "/var/run/tailscale/tailscaled.sock" }}
-    
-    # 网络配置
-    POD_CIDR={{ .Values.config.network.podCIDRBase | replace "/16" "/24" }}
-    SERVICE_CIDR={{ .Values.config.network.serviceCIDR }}
-    MTU={{ .Values.config.network.mtu }}
-    
-    # IPAM 配置
-    IPAM_TYPE={{ .Values.config.ipam.type }}
-    ALLOCATION_STRATEGY={{ .Values.config.ipam.strategy }} 
+  # Tailscale hostname configuration
+  TAILSCALE_HOSTNAME_PREFIX: {{ .Values.config.tailscale.hostname.prefix | quote }}
+  TAILSCALE_HOSTNAME_TYPE: {{ .Values.config.tailscale.hostname.type | quote }}
+  
+  # Tailscale user and tags
+  TAILSCALE_USER: {{ .Values.config.tailscale.user | quote }}
+  TAILSCALE_TAGS: {{ .Values.config.tailscale.tags | join "," | quote }}
+  
+  # Network configuration
+  POD_CIDR: {{ .Values.config.network.podCIDR | quote }}
+  SERVICE_CIDR: {{ .Values.config.network.serviceCIDR | quote }}
+  NETWORK_MTU: {{ .Values.config.network.mtu | quote }}
+  ENABLE_IPV6: {{ .Values.config.network.enableIPv6 | quote }}
+  ENABLE_NETWORK_POLICY: {{ .Values.config.network.enableNetworkPolicy | quote }}
+  
+  # IPAM configuration
+  IPAM_TYPE: {{ .Values.config.ipam.type | quote }}
+  IPAM_STRATEGY: {{ .Values.config.ipam.strategy | quote }}
+  IPAM_GC_INTERVAL: {{ .Values.config.ipam.gcInterval | quote }}
+  
+  # DNS configuration
+  MAGIC_DNS_ENABLED: {{ .Values.config.dns.magicDNS.enabled | quote }}
+  MAGIC_DNS_NAMESERVERS: {{ .Values.config.dns.magicDNS.nameservers | join "," | quote }}
+  MAGIC_DNS_SEARCH_DOMAINS: {{ .Values.config.dns.magicDNS.searchDomains | join "," | quote }}
+  MAGIC_DNS_OPTIONS: {{ .Values.config.dns.magicDNS.options | join "," | quote }}
+  
+  # Monitoring configuration
+  MONITORING_ENABLED: {{ .Values.config.monitoring.enabled | quote }}
+  METRICS_PORT: {{ .Values.config.monitoring.port | quote }}
+  METRICS_PATH: {{ .Values.config.monitoring.path | quote }}
+  
+  # Logging configuration
+  LOG_LEVEL: {{ .Values.config.logging.level | default "info" | quote }}
+  LOG_FORMAT: {{ .Values.config.logging.format | default "json" | quote }}
+  LOG_OUTPUT: {{ .Values.config.logging.output | default "stdout" | quote }} 

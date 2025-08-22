@@ -6,15 +6,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/pkg/logging"
+	"github.com/binrclab/headcni/pkg/utils"
+	"github.com/hashicorp/go-retryablehttp"
+	"go.uber.org/zap"
 )
 
 // Client 是 Headscale 客户端
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
-	authKey    string
+	baseURL         string
+	authKey         string
+	retryCount      int
+	retryableClient *retryablehttp.Client
 }
 
 // API 响应结构体
@@ -194,41 +203,93 @@ type SetPolicyResponse struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
-// NewClient 创建新的 Headscale 客户端
-func NewClient(baseURL, authKey string) (*Client, error) {
-	return &Client{
-		baseURL: baseURL,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		authKey: authKey,
-	}, nil
+// 在 NewClient 中配置
+func NewClient(cfg *config.HeadscaleConfig) (*Client, error) {
+	// 解析超时配置
+	timeout := utils.ParseTimeout(cfg.Timeout)
+
+	// 解析重试次数
+	retries := cfg.Retries
+	if retries < 0 {
+		retries = 3 // 默认重试3次
+	}
+
+	client := &Client{
+		baseURL:         strings.TrimSuffix(cfg.URL, "/"),
+		authKey:         cfg.AuthKey,
+		retryableClient: newRetryableClient(retries, timeout),
+		retryCount:      retries,
+	}
+
+	logging.Infof("Headscale client initialized - URL: %s, Timeout: %v, Retries: %d",
+		client.baseURL, timeout, retries)
+
+	return client, nil
 }
 
-// Ping 发送 ping 请求到 Headscale
-func (c *Client) Ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/v1/status", c.baseURL), nil)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %v", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to ping headscale: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("headscale ping failed with status: %d", resp.StatusCode)
-	}
-
-	return nil
+// retryableLogger 适配 zap.SugaredLogger 到 go-retryablehttp 的 Logger 接口
+type retryableLogger struct {
+	logger *zap.SugaredLogger
 }
 
-// 通用请求方法
+func (r *retryableLogger) Printf(format string, args ...interface{}) {
+	if r.logger != nil {
+		r.logger.Infof(format, args...)
+	}
+}
+
+// 创建默认的重试配置
+func newRetryableClient(retries int, timeout time.Duration) *retryablehttp.Client {
+	client := retryablehttp.NewClient()
+
+	// 基础重试配置
+	client.RetryMax = retries
+	client.RetryWaitMin = time.Second
+	client.RetryWaitMax = 10 * time.Second
+
+	// 使用指数退避 + 抖动
+	client.Backoff = retryablehttp.DefaultBackoff
+
+	// 配置超时
+	client.HTTPClient = &http.Client{
+		Timeout: timeout,
+	}
+
+	// 配置重试条件
+	client.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		// 如果上下文已取消，不重试
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+
+		// 超时错误重试
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			return true, nil
+		}
+
+		// 网络错误重试
+		if err != nil {
+			return true, nil
+		}
+
+		// 5xx 错误重试，4xx 错误不重试
+		if resp.StatusCode >= 500 {
+			return true, nil
+		}
+
+		return false, nil
+	}
+
+	// 配置日志 - 使用适配器包装 zap.SugaredLogger
+	zapLogger := logging.GetLogger()
+	if zapLogger != nil {
+		client.Logger = &retryableLogger{logger: zapLogger}
+	}
+
+	return client
+}
+
+// 通用请求方法（使用 retryablehttp）
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}, result interface{}) error {
 	var bodyReader io.Reader
 	if body != nil {
@@ -239,7 +300,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		bodyReader = bytes.NewReader(jsonBody)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, fmt.Sprintf("%s%s", c.baseURL, path), bodyReader)
+	req, err := retryablehttp.NewRequestWithContext(ctx, method, fmt.Sprintf("%s%s", c.baseURL, path), bodyReader)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %v", err)
 	}
@@ -253,9 +314,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := c.httpClient.Do(req)
+	// 直接使用已配置的 retryableClient，不需要重复配置
+	resp, err := c.retryableClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %v", err)
+		return fmt.Errorf("request failed after retries: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -586,4 +648,41 @@ func (c *Client) CleanupExpiredNodes(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ListAllRoutes 获取所有路由
+func (c *Client) ListAllRoutes(ctx context.Context) (*ListAllRoutesResponse, error) {
+	var result ListAllRoutesResponse
+	err := c.doRequest(ctx, "GET", "/api/v1/routes", nil, &result)
+	return &result, err
+}
+
+// ApproveRoute 批准路由（通过启用路由实现）
+func (c *Client) ApproveRoute(ctx context.Context, nodeID, routePrefix string) error {
+	// 首先获取所有路由，找到匹配的路由ID
+	routes, err := c.ListAllRoutes(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list routes: %v", err)
+	}
+
+	// 查找匹配的路由
+	var targetRouteID string
+	for _, route := range routes.Routes {
+		if route.Node.ID == nodeID && route.Prefix == routePrefix {
+			targetRouteID = route.ID
+			break
+		}
+	}
+
+	if targetRouteID == "" {
+		return fmt.Errorf("route %s not found for node %s", routePrefix, nodeID)
+	}
+
+	// 启用路由
+	return c.EnableRoute(ctx, targetRouteID)
+}
+
+// ListAllRoutesResponse 获取所有路由的响应
+type ListAllRoutesResponse struct {
+	Routes []Route `json:"routes"`
 }

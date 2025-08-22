@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/pterm/pterm"
 )
@@ -393,4 +394,60 @@ func showConfigExplanation() {
 	pterm.DefaultTable.WithHasHeader().WithData(explanation).Render()
 
 	pterm.Info.Println("💡 Tip: 敏感配置（如 headscale_url）可以通过环境变量设置，避免在配置文件中暴露")
+}
+
+// formatDuration 格式化持续时间
+func formatDuration(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+}
+
+// isPodReady 检查Pod是否就绪
+func isPodReady(podName, namespace string) bool {
+	cmd := exec.Command("kubectl", "get", "pod", podName, "-n", namespace,
+		"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+	output, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(output)) == "True"
+}
+
+// waitForPodReady 等待Pod就绪
+func waitForPodReady(podName, namespace string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if isPodReady(podName, namespace) {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return fmt.Errorf("timeout waiting for pod %s to be ready", podName)
+}
+
+// getPodIP 获取Pod IP
+func getPodIP(podName, namespace string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "pod", podName, "-n", namespace,
+		"-o", "jsonpath={.status.podIP}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// getServiceIP 获取Service IP
+func getServiceIP(serviceName, namespace string) (string, error) {
+	cmd := exec.Command("kubectl", "get", "service", serviceName, "-n", namespace,
+		"-o", "jsonpath={.spec.clusterIP}")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
 }

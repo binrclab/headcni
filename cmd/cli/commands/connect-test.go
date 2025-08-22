@@ -61,7 +61,7 @@ Examples:
 func runConnectTest(opts *ConnectTestOptions) error {
 	// 显示 ASCII logo
 	showLogo()
-	
+
 	fmt.Printf("🔗 Running HeadCNI connectivity tests...\n")
 	fmt.Printf("Namespace: %s\n", opts.Namespace)
 	fmt.Printf("Timeout: %d seconds\n\n", opts.Timeout)
