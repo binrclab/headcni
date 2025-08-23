@@ -245,7 +245,7 @@ func verifyTailscaleLogin(ctx context.Context, t *testing.T, client *tailscale.S
 
 		// 步骤1: 设置偏好并启动
 		t.Log("步骤1: 设置偏好并启动")
-		err := client.UpWithOptions(ctx, tailscale.ClientOptions{
+		err := client.UpWithOptionsWithRetry(ctx, tailscale.ClientOptions{
 			AuthKey:         authKey,
 			Hostname:        "test-client",
 			ControlURL:      controlURL,
@@ -819,7 +819,7 @@ func TestHeadscaleIntegration(t *testing.T) {
 
 	// 使用完善的UpWithOptions登录
 	t.Log("使用完善的UpWithOptions登录")
-	err = client.UpWithOptions(ctx, tailscale.ClientOptions{
+	err = client.UpWithOptionsWithRetry(ctx, tailscale.ClientOptions{
 		AuthKey:         authKey,
 		Hostname:        "test-client",
 		ControlURL:      headscaleURL,

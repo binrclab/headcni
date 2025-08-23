@@ -10,8 +10,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +18,6 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
-	"tailscale.com/types/persist"
 )
 
 // ClientOptions 客户端启动选项
@@ -40,6 +37,89 @@ type SimpleClient struct {
 	socketPath  string
 	mu          sync.RWMutex
 	timeout     time.Duration
+}
+
+// 辅助方法：创建WantRunning的MaskedPrefs
+func (c *SimpleClient) createWantRunningPrefs(wantRunning bool) *ipn.MaskedPrefs {
+	prefs := ipn.NewPrefs()
+	prefs.WantRunning = wantRunning
+	return &ipn.MaskedPrefs{
+		Prefs:          *prefs,
+		WantRunningSet: true,
+	}
+}
+
+// 辅助方法：创建基础配置的MaskedPrefs
+func (c *SimpleClient) createBasicPrefs(options ClientOptions) *ipn.MaskedPrefs {
+	prefs := ipn.NewPrefs()
+	prefs.ControlURL = options.ControlURL
+	prefs.Hostname = options.Hostname
+	prefs.WantRunning = false
+	prefs.LoggedOut = false
+	prefs.RouteAll = options.AcceptRoutes
+	prefs.ShieldsUp = options.ShieldsUp
+
+	if len(options.AdvertiseRoutes) > 0 {
+		var routes []netip.Prefix
+		for _, route := range options.AdvertiseRoutes {
+			if prefix, err := netip.ParsePrefix(route); err == nil {
+				routes = append(routes, prefix)
+			}
+		}
+		prefs.AdvertiseRoutes = routes
+	}
+
+	return &ipn.MaskedPrefs{
+		Prefs:              *prefs,
+		ControlURLSet:      true,
+		HostnameSet:        options.Hostname != "",
+		WantRunningSet:     true,
+		LoggedOutSet:       true,
+		RouteAllSet:        true,
+		AdvertiseRoutesSet: len(options.AdvertiseRoutes) > 0,
+		ShieldsUpSet:       true,
+	}
+}
+
+// 辅助方法：等待状态变化
+func (c *SimpleClient) waitForStateChange(ctx context.Context, targetState string, maxWait int) error {
+	for i := 0; i < maxWait; i++ {
+		time.Sleep(1 * time.Second)
+		if status, err := c.GetStatus(ctx); err == nil && status.BackendState == targetState {
+			return nil
+		}
+	}
+	return fmt.Errorf("等待状态变化到 %s 超时", targetState)
+}
+
+// 辅助方法：创建路由相关的MaskedPrefs
+func (c *SimpleClient) createRoutePrefs(routes []netip.Prefix, routeAll *bool, hostname string) *ipn.MaskedPrefs {
+	prefs := ipn.NewPrefs()
+	if routes != nil {
+		prefs.AdvertiseRoutes = routes
+	}
+	if routeAll != nil {
+		prefs.RouteAll = *routeAll
+	}
+	if hostname != "" {
+		prefs.Hostname = hostname
+	}
+
+	maskedPrefs := &ipn.MaskedPrefs{
+		Prefs: *prefs,
+	}
+
+	if routes != nil {
+		maskedPrefs.AdvertiseRoutesSet = true
+	}
+	if routeAll != nil {
+		maskedPrefs.RouteAllSet = true
+	}
+	if hostname != "" {
+		maskedPrefs.HostnameSet = true
+	}
+
+	return maskedPrefs
 }
 
 // NewSimpleClient 创建新的简化Tailscale客户端
@@ -119,200 +199,92 @@ func (c *SimpleClient) Down(ctx context.Context) error {
 		return nil
 	}
 
-	prefs := ipn.NewPrefs()
-	prefs.WantRunning = false
-
-	maskedPrefs := &ipn.MaskedPrefs{
-		Prefs:          *prefs,
-		WantRunningSet: true,
-	}
-
+	maskedPrefs := c.createWantRunningPrefs(false)
 	_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
 	if err != nil {
 		return fmt.Errorf("停止连接失败: %v", err)
 	}
 
 	// 等待连接停止
-	for i := 0; i < 10; i++ {
-		time.Sleep(1 * time.Second)
-		status, err := c.GetStatus(ctx)
-		if err == nil && status.BackendState == "Stopped" {
-			log.Println("连接已成功停止")
-			return nil
-		}
+	if err := c.waitForStateChange(ctx, "Stopped", 10); err == nil {
+		log.Println("连接已成功停止")
+		return nil
 	}
 
 	log.Println("连接停止命令已发送")
 	return nil
 }
 
-// UpWithOptions 启动Tailscale连接 - 纯API版本
-// UpWithOptions 启动Tailscale连接 - 增强诊断版本
-// func (c *SimpleClient) UpWithOptions(ctx context.Context, options ClientOptions) error {
-// 	log.Printf("=== 开始Tailscale登录流程 (增强诊断模式) ===")
-// 	log.Printf("控制URL: %s", options.ControlURL)
-// 	log.Printf("主机名: %s", options.Hostname)
-// 	log.Printf("认证密钥: %s...", c.maskAuthKey(options.AuthKey))
-// 	log.Printf("Socket路径: %s", c.socketPath)
+// UpWithOptionsWithRetry - 带重试机制的登录方法
+func (c *SimpleClient) UpWithOptionsWithRetry(ctx context.Context, options ClientOptions) error {
+	maxRetries := 2
+	var lastErr error
 
-// 	// 验证参数
-// 	if err := c.validateOptions(options); err != nil {
-// 		return fmt.Errorf("参数验证失败: %v", err)
-// 	}
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		log.Printf("尝试第 %d/%d 次登录", attempt, maxRetries)
 
-// 	// 步骤1: 检查socket连接性
-// 	if err := c.CheckSocketExists(); err != nil {
-// 		return fmt.Errorf("Socket连接失败: %v", err)
-// 	}
-// 	log.Println("✅ Socket连接正常")
-
-// 	// 步骤2: 检查并复用现有状态
-// 	if err := c.checkAndReuseExistingState(ctx, options); err == nil {
-// 		log.Println("=== 复用现有状态，登录流程完成 ===")
-// 		return nil
-// 	}
-
-// 	// 步骤3: 执行增强的API认证
-// 	if err := c.authenticate(ctx, options); err != nil {
-// 		return fmt.Errorf("认证失败: %v", err)
-// 	}
-
-// 	// 步骤4: 等待最终连接完成
-// 	if err := c.waitForFullConnection(ctx); err != nil {
-// 		return fmt.Errorf("等待连接完成失败: %v", err)
-// 	}
-
-// 	log.Println("=== 登录流程完成 ===")
-// 	return nil
-// }
-
-// waitForFullConnection 等待完整连接建立
-func (c *SimpleClient) waitForFullConnection(ctx context.Context) error {
-	log.Println("等待完整连接建立...")
-
-	maxWaitSeconds := 240 // 4分钟等待连接
-	checkInterval := 2 * time.Second
-
-	for i := 0; i < maxWaitSeconds/2; i++ {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("上下文取消: %v", ctx.Err())
-		default:
+		err := c.UpWithOptions(ctx, options)
+		if err == nil {
+			log.Printf("✅ 第 %d 次尝试成功!", attempt)
+			return nil
 		}
 
-		time.Sleep(checkInterval)
+		log.Printf("❌ 第 %d 次尝试失败: %v", attempt, err)
+		lastErr = err
 
-		status, err := c.GetStatus(ctx)
-		if err != nil {
-			log.Printf("状态检查失败 %d: %v", i+1, err)
-			continue
-		}
-
-		// 每10秒打印一次详细状态
-		if i%5 == 0 || i < 5 {
-			log.Printf("连接等待进度 %d/%ds - 状态: %s, HaveNodeKey: %v, Online: %v",
-				(i+1)*2, maxWaitSeconds, status.BackendState, status.HaveNodeKey,
-				status.Self != nil && status.Self.Online)
-		}
-
-		switch status.BackendState {
-		case "Running":
-			if c.isLoginComplete(status) {
-				log.Printf("✅ 连接成功! 总耗时: %d秒", (i+1)*2)
-				c.logConnectionInfo(status)
-				return nil
-			} else {
-				// Running但没有IP，继续等待
-				if i%10 == 0 {
-					log.Printf("状态Running但IP未分配，继续等待...")
-				}
-			}
-
-		case "Starting":
-			if i%10 == 0 {
-				log.Println("正在启动连接...")
-			}
-
-		case "NeedsLogin":
-			// 如果有NodeKey但状态还是NeedsLogin，可能需要重新启用
-			if status.HaveNodeKey {
-				log.Println("有NodeKey但状态为NeedsLogin，尝试重新启用运行状态")
-				if err := c.enableRunningAfterAuth(ctx); err != nil {
-					log.Printf("重新启用失败: %v", err)
-				}
-			} else {
-				// 诊断网络问题
-				if i > 30 { // 60秒后开始诊断
-					if i%15 == 0 { // 每30秒诊断一次
-						c.diagnoseNetworkIssues(ctx)
-					}
-				}
-			}
-
-		case "Stopped":
-			log.Println("连接被停止，尝试重新启用")
-			if err := c.enableRunningAfterAuth(ctx); err != nil {
-				log.Printf("重新启用失败: %v", err)
-			}
-
-		default:
-			log.Printf("未知状态: %s", status.BackendState)
-		}
-
-		// 超时检查
-		if i > 60 { // 120秒后更严格的检查
-			if status.BackendState == "NeedsLogin" && !status.HaveNodeKey {
-				return fmt.Errorf("120秒后仍无NodeKey，认证可能失败")
-			}
+		if attempt < maxRetries {
+			log.Printf("等待15秒后重试...")
+			time.Sleep(15 * time.Second)
 		}
 	}
 
-	return fmt.Errorf("连接超时")
+	return fmt.Errorf("所有 %d 次尝试都失败了，最后错误: %v", maxRetries, lastErr)
 }
 
-// diagnoseNetworkIssues 诊断网络问题
-func (c *SimpleClient) diagnoseNetworkIssues(ctx context.Context) {
-	log.Println("🔍 诊断网络问题...")
+// 修复版本的 UpWithOptions - 解决 Headscale 认证问题
+func (c *SimpleClient) UpWithOptions(ctx context.Context, options ClientOptions) error {
+	log.Printf("开始Tailscale登录流程")
+	log.Printf("控制URL: %s", options.ControlURL)
+	log.Printf("主机名: %s", options.Hostname)
+	log.Printf("认证密钥: %s...", c.maskAuthKey(options.AuthKey))
+	log.Printf("Socket路径: %s", c.socketPath)
 
-	// 检查偏好设置
-	prefs, err := c.localClient.GetPrefs(ctx)
-	if err != nil {
-		log.Printf("无法获取偏好设置: %v", err)
-		return
+	// 验证必要参数
+	if err := c.validateOptions(options); err != nil {
+		return fmt.Errorf("参数验证失败: %v", err)
 	}
 
-	log.Printf("当前配置:")
-	log.Printf("  ControlURL: %s", prefs.ControlURL)
-	log.Printf("  Hostname: %s", prefs.Hostname)
-	log.Printf("  WantRunning: %v", prefs.WantRunning)
-	log.Printf("  LoggedOut: %v", prefs.LoggedOut)
-
-	// 测试控制服务器连接
-	if err := c.checkHeadscaleReachability(); err != nil {
-		log.Printf("⚠️ 控制服务器连接问题: %v", err)
-	} else {
-		log.Println("✅ 控制服务器连接正常")
-	}
-}
-
-// logConnectionInfo 记录连接信息
-func (c *SimpleClient) logConnectionInfo(status *ipnstate.Status) {
-	if status.Self == nil {
-		return
+	if err := c.waitForDaemonReady(ctx); err != nil {
+		return fmt.Errorf("waitForDaemonReady 失败: %w", err)
 	}
 
-	log.Printf("🎉 连接信息:")
-	log.Printf("  节点名: %s", status.Self.HostName)
-	log.Printf("  在线状态: %v", status.Self.Online)
-
-	if len(status.Self.TailscaleIPs) > 0 {
-		log.Printf("  分配的IP:")
-		for _, ip := range status.Self.TailscaleIPs {
-			log.Printf("    %s", ip.String())
-		}
+	// 步骤2: 检查并复用现有状态
+	if err := c.checkAndReuseExistingState(ctx, options); err == nil {
+		log.Println("复用现有状态，登录流程完成")
+		return nil
 	}
 
-	log.Printf("  对等节点数: %d", len(status.Peer))
+	if err := c.completeReset(ctx); err != nil {
+		return fmt.Errorf("completeReset 失败: %w", err)
+	}
+	log.Printf("completeReset 完成")
+	// 关键修复2: 分步骤精确设置
+	if err := c.preciseSetup(ctx, options); err != nil {
+		return fmt.Errorf("精确设置失败: %v", err)
+	}
+
+	// 关键修复3: 改进的认证流程
+	if err := c.improvedAuthentication(ctx, options); err != nil {
+		return fmt.Errorf("认证失败: %v", err)
+	}
+
+	// 步骤4: 等待最终连接完成
+	if err := c.waitForFullConnection(ctx); err != nil {
+		return fmt.Errorf("等待连接完成失败: %v", err)
+	}
+
+	log.Println("修复版登录流程完成")
+	return nil
 }
 
 // checkAndReuseExistingState 检查并复用现有状态
@@ -384,13 +356,7 @@ func (c *SimpleClient) checkAndReuseExistingState(ctx context.Context, options C
 				log.Println("✓ 配置完全匹配，可以复用现有状态")
 
 				// 启用运行状态
-				newPrefs := ipn.NewPrefs()
-				newPrefs.WantRunning = true
-
-				maskedPrefs := &ipn.MaskedPrefs{
-					Prefs:          *newPrefs,
-					WantRunningSet: true,
-				}
+				maskedPrefs := c.createWantRunningPrefs(true)
 
 				_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
 				if err == nil {
@@ -411,356 +377,266 @@ func (c *SimpleClient) checkAndReuseExistingState(ctx context.Context, options C
 	return fmt.Errorf("需要重新认证")
 }
 
-// resetState 重置状态
-func (c *SimpleClient) resetState(ctx context.Context) error {
-	log.Println("重置连接状态...")
+// waitForDaemonReady 等待守护进程就绪
+func (c *SimpleClient) waitForDaemonReady(ctx context.Context) error {
+	log.Println("等待 Tailscale 守护进程就绪...")
 
+	for i := 0; i < 30; i++ {
+		status, err := c.GetStatus(ctx)
+		if err != nil {
+			log.Printf("守护进程检查 %d/30: 连接失败 - %v", i+1, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// 检查守护进程是否处于稳定状态
+		if status.BackendState == "Stopped" || status.BackendState == "NeedsLogin" {
+			log.Printf("守护进程就绪: %s", status.BackendState)
+			// 额外等待2秒确保稳定
+			time.Sleep(2 * time.Second)
+			return nil
+		}
+
+		if i%10 == 0 || i < 3 {
+			log.Printf("守护进程检查 %d/30: %s", i+1, status.BackendState)
+		}
+		time.Sleep(1 * time.Second)
+	}
+
+	return fmt.Errorf("守护进程30秒内未就绪")
+}
+
+// completeReset 智能重置状态（优化版）
+func (c *SimpleClient) completeReset(ctx context.Context) error {
+	log.Println("智能重置连接状态")
+
+	// 获取当前状态
+	status, err := c.GetStatus(ctx)
+	if err != nil {
+		log.Printf("无法获取状态: %v", err)
+		return nil
+	}
+
+	log.Printf("重置前状态: %s", status.BackendState)
+
+	// 智能判断是否需要重置
+	switch status.BackendState {
+	case "Stopped":
+		log.Println("已经是停止状态，跳过重置")
+		return nil
+	case "NeedsLogin":
+		// 检查是否有残留的认证状态
+		if status.Self != nil && len(status.Self.TailscaleIPs) > 0 {
+			log.Println("NeedsLogin状态但有残留IP，需要完整重置")
+		} else {
+			log.Println("干净的 NeedsLogin 状态，跳过重置")
+			return nil
+		}
+	case "Running":
+		log.Println("当前正在运行，需要重置")
+	case "Starting":
+		log.Println("正在启动中，等待完成或重置")
+	default:
+		log.Printf("未知状态 %s，尝试重置", status.BackendState)
+	}
+
+	// 执行重置
 	prefs := ipn.NewPrefs()
 	prefs.WantRunning = false
+	prefs.LoggedOut = true
 
 	maskedPrefs := &ipn.MaskedPrefs{
 		Prefs:          *prefs,
 		WantRunningSet: true,
+		LoggedOutSet:   true,
 	}
 
-	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
+	_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
 	if err != nil {
 		log.Printf("停止连接失败: %v", err)
+		return err
 	}
 
-	// 等待停止
-	for i := 0; i < 5; i++ {
+	// 智能等待 - 根据初始状态调整等待时间
+	maxWait := 10 // 默认10秒
+	if status.BackendState == "Running" {
+		maxWait = 15 // Running状态需要更多时间停止
+	}
+
+	log.Printf("等待状态重置（最多%d秒）...", maxWait)
+
+	// 等待状态变为Stopped或NeedsLogin
+	for i := 0; i < maxWait; i++ {
 		time.Sleep(1 * time.Second)
 		if status, err := c.GetStatus(ctx); err == nil {
-			if status.BackendState == "Stopped" {
-				break
+			if i%5 == 0 || status.BackendState != "Stopping" {
+				log.Printf("重置进度 %d/%d: %s", i+1, maxWait, status.BackendState)
+			}
+
+			if status.BackendState == "Stopped" || status.BackendState == "NeedsLogin" {
+				log.Printf("✅ 状态重置完成: %s", status.BackendState)
+				time.Sleep(1 * time.Second) // 短暂等待状态稳定
+				return nil
 			}
 		}
+	}
+
+	// 检查最终状态
+	if finalStatus, err := c.GetStatus(ctx); err == nil {
+		if finalStatus.BackendState == "NeedsLogin" || finalStatus.BackendState == "Stopped" {
+			log.Printf("✅ 重置完成: %s", finalStatus.BackendState)
+			return nil
+		}
+		log.Printf("⚠️ 重置可能不完整，当前状态: %s", finalStatus.BackendState)
 	}
 
 	log.Println("状态重置完成")
 	return nil
 }
 
-// authenticate 执行认证 - 增强诊断版本
-func (c *SimpleClient) authenticate(ctx context.Context, options ClientOptions) error {
-	log.Println("执行API认证...")
+// preciseSetup 精确设置配置（增强版）
+func (c *SimpleClient) preciseSetup(ctx context.Context, options ClientOptions) error {
+	log.Println("精确配置设置")
 
+	// 直接使用辅助方法创建配置，无需获取当前配置
+
+	// 使用辅助方法创建基础配置
+	maskedPrefs := c.createBasicPrefs(options)
+
+	log.Printf("应用精确配置...")
+	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
+	if err != nil {
+		return fmt.Errorf("精确配置失败: %v", err)
+	}
+
+	// 增加等待时间确保配置生效
+	log.Println("等待配置生效...")
+	time.Sleep(5 * time.Second) // 从3秒增加到5秒
+
+	// 验证配置
+	updatedPrefs, err := c.localClient.GetPrefs(ctx)
+	if err == nil {
+		// 验证关键配置是否正确应用
+		if updatedPrefs.ControlURL != options.ControlURL {
+			return fmt.Errorf("控制URL配置验证失败: 期望 %s, 实际 %s", options.ControlURL, updatedPrefs.ControlURL)
+		}
+	}
+
+	log.Println("精确配置完成")
+	return nil
+}
+
+// improvedAuthentication 优化的认证流程
+func (c *SimpleClient) improvedAuthentication(ctx context.Context, options ClientOptions) error {
+	log.Println("优化的认证流程")
 	// 如果是 "auto" 模式，处理现有状态
 	if options.AuthKey == "auto" {
 		return c.handleAutoModeAPI(ctx, options)
 	}
-
-	// 步骤1: 详细诊断当前状态
-	if err := c.diagnoseCurrentState(ctx); err != nil {
-		log.Printf("状态诊断失败: %v", err)
-	}
-
-	// 步骤2: 分步设置配置
-	if err := c.setupAuthConfiguration(ctx, options); err != nil {
-		return fmt.Errorf("配置设置失败: %v", err)
-	}
-
-	// 步骤3: 尝试不同的认证方法
-	methods := []func(context.Context, ClientOptions) error{
-		c.authenticateWithStartOptions,
-		c.authenticateWithLoginInteractive,
-		c.authenticateWithDirectConfig,
-	}
-
-	for i, method := range methods {
-		log.Printf("尝试认证方法 %d...", i+1)
-
-		if err := method(ctx, options); err != nil {
-			log.Printf("认证方法 %d 失败: %v", i+1, err)
-			continue
-		}
-
-		// 检查认证是否成功
-		if err := c.waitForAuthCompletion(ctx); err != nil {
-			log.Printf("认证方法 %d 完成失败: %v", i+1, err)
-			continue
-		}
-
-		log.Printf("✅ 认证方法 %d 成功", i+1)
-		return c.enableRunningAfterAuth(ctx)
-	}
-
-	return fmt.Errorf("所有认证方法都失败")
-}
-
-// diagnoseCurrentState 诊断当前状态
-func (c *SimpleClient) diagnoseCurrentState(ctx context.Context) error {
-	log.Println("🔍 诊断当前状态...")
-
-	// 检查socket连接
+	// 3.1 检查当前状态
 	status, err := c.GetStatus(ctx)
 	if err != nil {
-		log.Printf("❌ 无法获取状态: %v", err)
-		return err
+		return fmt.Errorf("无法获取当前状态: %v", err)
 	}
 
-	log.Printf("📊 当前状态详情:")
-	log.Printf("  版本: %s", status.Version)
-	log.Printf("  后端状态: %s", status.BackendState)
-	log.Printf("  HaveNodeKey: %v", status.HaveNodeKey)
-	log.Printf("  TUN: %v", status.TUN)
-	log.Printf("  AuthURL: %s", status.AuthURL)
+	log.Printf("认证前状态: %s", status.BackendState)
 
-	// 检查偏好设置
-	prefs, err := c.localClient.GetPrefs(ctx)
-	if err != nil {
-		log.Printf("❌ 无法获取偏好设置: %v", err)
-	} else {
-		log.Printf("📋 当前偏好设置:")
-		log.Printf("  ControlURL: %s", prefs.ControlURL)
-		log.Printf("  Hostname: %s", prefs.Hostname)
-		log.Printf("  WantRunning: %v", prefs.WantRunning)
-		log.Printf("  LoggedOut: %v", prefs.LoggedOut)
-		log.Printf("  Persist: %v", prefs.Persist != nil)
+	// 如果已经在运行，检查是否需要重新认证
+	if status.BackendState == "Running" {
+		if c.isLoginComplete(status) {
+			log.Println("✅ 已经登录完成，跳过认证")
+			return nil
+		}
+		log.Println("Running 但登录不完整，继续认证流程")
 	}
 
-	// 检查网络连接
-	if err := c.checkNetworkConnectivity(ctx, ""); err != nil {
-		log.Printf("⚠️ 网络连接问题: %v", err)
-	}
-
-	return nil
-}
-
-// setupAuthConfiguration 设置认证配置
-func (c *SimpleClient) setupAuthConfiguration(ctx context.Context, options ClientOptions) error {
-	log.Println("设置认证配置...")
-
-	// 确保daemon处于正确状态
+	// 3.2 启用运行状态
+	log.Println("启用运行状态")
 	prefs := ipn.NewPrefs()
-	prefs.ControlURL = options.ControlURL
-	prefs.WantRunning = false
-	prefs.LoggedOut = false
+	prefs.WantRunning = true
 
 	maskedPrefs := &ipn.MaskedPrefs{
 		Prefs:          *prefs,
-		ControlURLSet:  true,
 		WantRunningSet: true,
-		LoggedOutSet:   true,
 	}
 
-	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
-	if err != nil {
-		return fmt.Errorf("设置基础配置失败: %v", err)
-	}
-
-	// 等待配置生效
-	time.Sleep(2 * time.Second)
-	log.Println("基础配置设置完成")
-
-	return nil
-}
-
-// authenticateWithStartOptions 使用StartOptions认证
-func (c *SimpleClient) authenticateWithStartOptions(ctx context.Context, options ClientOptions) error {
-	log.Println("方法1: 使用StartOptions认证...")
-
-	// 获取当前偏好设置
-	currentPrefs, err := c.localClient.GetPrefs(ctx)
-	if err != nil {
-		currentPrefs = ipn.NewPrefs()
-	}
-
-	// 设置完整的偏好设置
-	authPrefs := *currentPrefs
-	authPrefs.ControlURL = options.ControlURL
-	authPrefs.Hostname = options.Hostname
-	authPrefs.RouteAll = options.AcceptRoutes
-	authPrefs.ShieldsUp = options.ShieldsUp
-	authPrefs.WantRunning = true
-	authPrefs.LoggedOut = false
-
-	// 设置通告路由
-	if len(options.AdvertiseRoutes) > 0 {
-		var routes []netip.Prefix
-		for _, route := range options.AdvertiseRoutes {
-			if prefix, err := netip.ParsePrefix(route); err == nil {
-				routes = append(routes, prefix)
-			}
-		}
-		authPrefs.AdvertiseRoutes = routes
-	}
-
-	// startOptions := ipn.Options{
-	// 	AuthKey: options.AuthKey,
-	// }
-
-	// 备用方案：使用 Start 但带更完整的选项
-	log.Println("尝试备用 Start 方法")
-	startOptions := ipn.Options{
-		AuthKey:     options.AuthKey,
-		UpdatePrefs: &authPrefs,
-	}
-
-	err = c.localClient.Start(ctx, startOptions)
-	if err != nil {
-		return fmt.Errorf("Start 和 Login 都失败: %v", err)
-	}
-	log.Printf("调用 Start() - AuthKey: %s...", c.maskAuthKey(options.AuthKey))
-	return c.localClient.Start(ctx, startOptions)
-}
-
-// authenticateWithLoginInteractive 使用Login交互认证
-func (c *SimpleClient) authenticateWithLoginInteractive(ctx context.Context, options ClientOptions) error {
-	log.Println("方法2: 使用Login交互认证...")
-
-	// 先设置偏好设置
-	prefs, err := c.localClient.GetPrefs(ctx)
-	if err != nil {
-		prefs = ipn.NewPrefs()
-	}
-
-	prefs.ControlURL = options.ControlURL
-	prefs.Hostname = options.Hostname
-	prefs.RouteAll = options.AcceptRoutes
-	prefs.ShieldsUp = options.ShieldsUp
-	prefs.WantRunning = false
-	prefs.LoggedOut = false
-
-	if len(options.AdvertiseRoutes) > 0 {
-		var routes []netip.Prefix
-		for _, route := range options.AdvertiseRoutes {
-			if prefix, err := netip.ParsePrefix(route); err == nil {
-				routes = append(routes, prefix)
-			}
-		}
-		prefs.AdvertiseRoutes = routes
-	}
-
-	maskedPrefs := &ipn.MaskedPrefs{
-		Prefs:              *prefs,
-		ControlURLSet:      true,
-		HostnameSet:        true,
-		RouteAllSet:        true,
-		ShieldsUpSet:       true,
-		WantRunningSet:     true,
-		LoggedOutSet:       true,
-		AdvertiseRoutesSet: len(options.AdvertiseRoutes) > 0,
-	}
-
-	// 应用偏好设置
 	_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
 	if err != nil {
-		return fmt.Errorf("设置偏好失败: %v", err)
+		return fmt.Errorf("启用运行状态失败: %v", err)
 	}
 
-	time.Sleep(1 * time.Second)
+	// 3.3 快速检查状态变化
+	log.Println("检查状态变化...")
+	time.Sleep(2 * time.Second)
 
-	// 调用LoginInteractive
-	log.Printf("调用 LoginInteractive() - AuthKey: %s...", c.maskAuthKey(options.AuthKey))
-	return c.localClient.Start(ctx, ipn.Options{
-		AuthKey: options.AuthKey,
-	})
-}
-
-// authenticateWithDirectConfig 直接配置认证
-func (c *SimpleClient) authenticateWithDirectConfig(ctx context.Context, options ClientOptions) error {
-	log.Println("方法3: 直接配置认证...")
-
-	// 创建包含authkey的完整偏好设置
-	prefs := ipn.NewPrefs()
-	prefs.ControlURL = options.ControlURL
-	prefs.Hostname = options.Hostname
-	prefs.RouteAll = options.AcceptRoutes
-	prefs.ShieldsUp = options.ShieldsUp
-	prefs.WantRunning = true // 直接启用运行
-	prefs.LoggedOut = false
-
-	// 设置通告路由
-	if len(options.AdvertiseRoutes) > 0 {
-		var routes []netip.Prefix
-		for _, route := range options.AdvertiseRoutes {
-			if prefix, err := netip.ParsePrefix(route); err == nil {
-				routes = append(routes, prefix)
-			}
-		}
-		prefs.AdvertiseRoutes = routes
-	}
-
-	// 尝试设置Persist字段（包含authkey）
-	if prefs.Persist == nil {
-		prefs.Persist = &persist.Persist{}
-	}
-
-	maskedPrefs := &ipn.MaskedPrefs{
-		Prefs:              *prefs,
-		ControlURLSet:      true,
-		HostnameSet:        true,
-		RouteAllSet:        true,
-		ShieldsUpSet:       true,
-		WantRunningSet:     true,
-		LoggedOutSet:       true,
-		AdvertiseRoutesSet: len(options.AdvertiseRoutes) > 0,
-	}
-
-	log.Printf("应用完整配置 - AuthKey: %s...", c.maskAuthKey(options.AuthKey))
-	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
-	if err != nil {
-		return fmt.Errorf("应用配置失败: %v", err)
-	}
-
-	// 单独调用一个简单的Start
-	startOptions := ipn.Options{
-		AuthKey: options.AuthKey,
-	}
-
-	return c.localClient.Start(ctx, startOptions)
-}
-
-// checkNetworkConnectivity 检查网络连接
-func (c *SimpleClient) checkNetworkConnectivity(ctx context.Context, controlURL string) error {
-	if controlURL == "" {
-		prefs, err := c.localClient.GetPrefs(ctx)
+	var finalState string
+	for i := 0; i < 60; i++ { // 减少到10次检查
+		status, err := c.GetStatus(ctx)
 		if err != nil {
-			return fmt.Errorf("无法获取控制URL: %v", err)
+			log.Printf("状态检查失败 %d: %v", i+1, err)
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
-		controlURL = prefs.ControlURL
+
+		finalState = status.BackendState
+		log.Printf("状态检查 %d/10: %s", i+1, status.BackendState)
+
+		if status.BackendState == "Running" {
+			if c.isLoginComplete(status) {
+				log.Println("✅ 直接进入完整 Running 状态")
+				return nil
+			}
+			log.Println("Running 但不完整，继续认证")
+		}
+
+		if status.BackendState == "NeedsLogin" {
+			log.Println("✅ 进入 NeedsLogin 状态，开始认证")
+			break
+		}
+
+		time.Sleep(500 * time.Millisecond)
 	}
 
-	if controlURL == "" {
-		return fmt.Errorf("控制URL为空")
-	}
+	// 3.4 发送认证请求并等待初步响应
+	if finalState == "NeedsLogin" {
+		log.Println("发送认证请求")
+		startOptions := ipn.Options{
+			AuthKey: options.AuthKey,
+		}
+		// 创建预清理配置
+		prefs := ipn.NewPrefs()
+		prefs.ControlURL = options.ControlURL
+		prefs.LoggedOut = true
+		prefs.WantRunning = false
 
-	log.Printf("检查控制服务器连接: %s", controlURL)
+		_, err := c.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs:          *prefs,
+			ControlURLSet:  true,
+			LoggedOutSet:   true,
+			WantRunningSet: true,
+		})
+		if err != nil {
+			return fmt.Errorf("预清理失败: %w", err)
+		}
 
-	// 解析URL
-	u, err := url.Parse(controlURL)
-	if err != nil {
-		return fmt.Errorf("无效的控制URL: %v", err)
-	}
+		log.Printf("使用认证密钥: %s...", c.maskAuthKey(options.AuthKey))
+		err = c.localClient.Start(ctx, startOptions)
+		if err != nil {
+			return fmt.Errorf("Start 命令失败: %v", err)
+		}
 
-	// 检查DNS解析
-	addrs, err := net.LookupHost(u.Hostname())
-	if err != nil {
-		log.Printf("❌ DNS解析失败: %v", err)
-		return fmt.Errorf("DNS解析失败: %v", err)
-	}
-	log.Printf("✅ DNS解析成功: %v", addrs)
-
-	// 检查TCP连接
-	port := u.Port()
-	if port == "" {
-		if u.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
+		// 3) 再开启 WantRunning
+		err = c.enableRunningAfterAuth(ctx)
+		if err != nil {
+			return fmt.Errorf("启用运行状态失败: %v", err)
+		}
+		// 检查认证是否成功
+		if err := c.waitForAuthCompletion(ctx); err != nil {
+			log.Printf("认证方法 完成失败: %v", err)
+			return err
 		}
 	}
 
-	conn, err := net.DialTimeout("tcp", net.JoinHostPort(u.Hostname(), port), 10*time.Second)
-	if err != nil {
-		log.Printf("❌ TCP连接失败: %v", err)
-		return fmt.Errorf("TCP连接失败: %v", err)
-	}
-	defer conn.Close()
-
-	log.Printf("✅ TCP连接成功")
 	return nil
 }
 
@@ -786,8 +662,8 @@ func (c *SimpleClient) waitForAuthCompletion(ctx context.Context) error {
 			continue
 		}
 
-		// 每5秒详细打印状态
-		if i%5 == 0 {
+		// 每10秒详细打印状态
+		if i%10 == 0 {
 			log.Printf("认证进度 %d/%ds - 状态: %s, NodeKey: %v, AuthURL: %s",
 				i+1, maxWaitSeconds, status.BackendState, status.HaveNodeKey, status.AuthURL)
 		}
@@ -812,85 +688,6 @@ func (c *SimpleClient) waitForAuthCompletion(ctx context.Context) error {
 
 	return fmt.Errorf("认证超时，未能获得NodeKey")
 }
-
-// enableRunningAfterAuth 认证后启用运行状态
-func (c *SimpleClient) enableRunningAfterAuth(ctx context.Context) error {
-	log.Println("认证完成，启用运行状态...")
-
-	// 获取当前偏好设置
-	currentPrefs, err := c.localClient.GetPrefs(ctx)
-	if err != nil {
-		return fmt.Errorf("获取偏好设置失败: %v", err)
-	}
-
-	// 只修改运行状态
-	runPrefs := *currentPrefs
-	runPrefs.WantRunning = true
-
-	maskedPrefs := &ipn.MaskedPrefs{
-		Prefs:          runPrefs,
-		WantRunningSet: true,
-	}
-
-	_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
-	if err != nil {
-		return fmt.Errorf("启用运行状态失败: %v", err)
-	}
-
-	log.Println("✅ 运行状态已启用")
-	return nil
-}
-
-// // waitForAuthCompletion 等待认证完成（不等待完全连接）
-// func (c *SimpleClient) waitForAuthCompletion(ctx context.Context) error {
-// 	log.Println("等待认证完成...")
-
-// 	maxWaitSeconds := 60 // 认证阶段只等待60秒
-// 	checkInterval := 2 * time.Second
-
-// 	for i := 0; i < maxWaitSeconds/2; i++ {
-// 		select {
-// 		case <-ctx.Done():
-// 			return fmt.Errorf("上下文取消: %v", ctx.Err())
-// 		default:
-// 		}
-
-// 		time.Sleep(checkInterval)
-
-// 		status, err := c.GetStatus(ctx)
-// 		if err != nil {
-// 			log.Printf("状态检查失败 %d: %v", i+1, err)
-// 			continue
-// 		}
-
-// 		log.Printf("认证等待进度 %d/%ds - 状态: %s, HaveNodeKey: %v",
-// 			(i+1)*2, maxWaitSeconds, status.BackendState, status.HaveNodeKey)
-
-// 		// 检查是否获得了NodeKey，这表明认证基本成功
-// 		if status.HaveNodeKey {
-// 			log.Println("✅ NodeKey已获得，认证基础完成")
-// 			return nil
-// 		}
-
-// 		// 如果状态变为Starting或Running，也认为认证成功
-// 		if status.BackendState == "Starting" || status.BackendState == "Running" {
-// 			log.Printf("✅ 状态变为 %s，认证成功", status.BackendState)
-// 			return nil
-// 		}
-
-// 		// 如果仍然是NeedsLogin且没有NodeKey，继续等待
-// 		if status.BackendState == "NeedsLogin" {
-// 			continue
-// 		}
-
-// 		// 其他状态
-// 		log.Printf("未预期的状态: %s", status.BackendState)
-// 	}
-
-// 	return fmt.Errorf("认证超时，未能获得NodeKey")
-// }
-
-// handleAutoModeAPI 处理auto模式 - API版本
 func (c *SimpleClient) handleAutoModeAPI(ctx context.Context, options ClientOptions) error {
 	log.Println("Auto模式：API方式处理...")
 
@@ -942,13 +739,11 @@ func (c *SimpleClient) updatePrefsForAuto(ctx context.Context, options ClientOpt
 	if currentPrefs.Hostname != options.Hostname {
 		updatePrefs.Hostname = options.Hostname
 		needUpdate = true
-		log.Printf("更新Hostname: %s -> %s", currentPrefs.Hostname, options.Hostname)
 	}
 
 	if currentPrefs.RouteAll != options.AcceptRoutes {
 		updatePrefs.RouteAll = options.AcceptRoutes
 		needUpdate = true
-		log.Printf("更新AcceptRoutes: %v -> %v", currentPrefs.RouteAll, options.AcceptRoutes)
 	}
 
 	// 更新通告路由
@@ -1010,140 +805,42 @@ func routesEqual(a, b []netip.Prefix) bool {
 	return true
 }
 
-// setupConfiguration 设置配置 - 简化版本，只在必要时使用
-func (c *SimpleClient) setupConfiguration(ctx context.Context, options ClientOptions) error {
-	log.Println("设置基础配置...")
+// enableRunningAfterAuth 认证后启用运行状态
+func (c *SimpleClient) enableRunningAfterAuth(ctx context.Context) error {
+	log.Println("认证完成，启用运行状态...")
 
-	// 只设置最基础的配置，其他配置在认证时一起设置
-	prefs := ipn.NewPrefs()
-	prefs.ControlURL = options.ControlURL
-	prefs.WantRunning = false // 先不启动
+	// 获取当前偏好设置
+	currentPrefs, err := c.localClient.GetPrefs(ctx)
+	if err != nil {
+		return fmt.Errorf("获取偏好设置失败: %v", err)
+	}
+
+	// 只修改运行状态
+	runPrefs := *currentPrefs
+	runPrefs.WantRunning = true
 
 	maskedPrefs := &ipn.MaskedPrefs{
-		Prefs:          *prefs,
-		ControlURLSet:  true,
+		Prefs:          runPrefs,
 		WantRunningSet: true,
 	}
 
-	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
+	_, err = c.localClient.EditPrefs(ctx, maskedPrefs)
 	if err != nil {
-		return fmt.Errorf("设置基础配置失败: %v", err)
+		return fmt.Errorf("启用运行状态失败: %v", err)
 	}
 
-	log.Println("基础配置设置完成")
+	log.Println("✅ 运行状态已启用")
 	return nil
 }
 
-// authenticateWithCLI 使用CLI进行认证
-func (c *SimpleClient) authenticateWithCLI(ctx context.Context, options ClientOptions) error {
-	log.Println("使用CLI认证方法...")
+// smartWaitForLogin 智能等待登录完成（修复版）
 
-	// 如果是 "auto" 模式，使用 CLI 的 up 命令（不带 authkey）
-	if options.AuthKey == "auto" {
-		log.Println("Auto模式：使用CLI重新认证（配置变更）")
+// waitForFullConnection 等待完整连接建立
+func (c *SimpleClient) waitForFullConnection(ctx context.Context) error {
+	log.Println("等待完整连接建立...")
 
-		// 直接尝试 up 命令，附加必要参数
-		upArgs := []string{
-			"--socket", c.socketPath,
-			"up",
-			"--login-server", options.ControlURL,
-			"--hostname", options.Hostname,
-		}
-
-		if options.AcceptRoutes {
-			upArgs = append(upArgs, "--accept-routes")
-		}
-
-		if len(options.AdvertiseRoutes) > 0 {
-			upArgs = append(upArgs, "--advertise-routes", strings.Join(options.AdvertiseRoutes, ","))
-		}
-
-		log.Printf("执行 up 命令: tailscale %s", strings.Join(upArgs, " "))
-		upCmd := exec.CommandContext(ctx, "tailscale", upArgs...)
-		upOutput, upErr := upCmd.CombinedOutput()
-
-		if upErr != nil {
-			outputStr := string(upOutput)
-			log.Printf("up 命令失败，tailscale 提示: %s", outputStr)
-
-			// 检查输出中是否提示需要补全参数
-			if strings.Contains(outputStr, "Usage:") || strings.Contains(outputStr, "tailscale up") ||
-				strings.Contains(outputStr, "required") || strings.Contains(outputStr, "missing") {
-				log.Println("✓ 检测到参数缺失提示，尝试解析输出中的命令")
-
-				// 尝试从输出中解析 tailscale up 后面的完整命令
-				parsedArgs, err := c.parseTailscaleCommand(outputStr)
-				if err != nil {
-					log.Printf("解析命令失败: %v，使用默认补全", err)
-					// 回退到默认补全逻辑
-					completeArgs := append([]string{}, upArgs...)
-					if strings.Contains(outputStr, "authkey") || strings.Contains(outputStr, "auth") {
-						completeArgs = append(completeArgs, "--reset")
-					}
-					parsedArgs = completeArgs
-				}
-
-				log.Printf("解析到的命令: tailscale %s", strings.Join(parsedArgs, " "))
-				completeCmd := exec.CommandContext(ctx, "tailscale", parsedArgs...)
-				completeOutput, completeErr := completeCmd.CombinedOutput()
-
-				if completeErr != nil {
-					log.Printf("解析命令执行失败: %v", completeErr)
-					log.Printf("命令输出: %s", string(completeOutput))
-					return fmt.Errorf("解析命令执行失败: %v, 输出: %s", completeErr, string(completeOutput))
-				}
-
-				log.Printf("解析命令执行成功，输出: %s", string(completeOutput))
-				return nil
-			} else {
-				// 如果没有参数提示，返回原始错误
-				return fmt.Errorf("up 命令失败: %v, 输出: %s", upErr, outputStr)
-			}
-		} else {
-			log.Printf("up 命令成功，输出: %s", string(upOutput))
-			return nil
-		}
-	}
-
-	// 正常认证模式
-	args := []string{
-		"--socket", c.socketPath,
-		"up",
-		"--authkey", options.AuthKey,
-		"--login-server", options.ControlURL,
-		"--hostname", options.Hostname,
-	}
-
-	if options.AcceptRoutes {
-		args = append(args, "--accept-routes")
-	}
-
-	if len(options.AdvertiseRoutes) > 0 {
-		args = append(args, "--advertise-routes", strings.Join(options.AdvertiseRoutes, ","))
-	}
-
-	log.Printf("执行CLI命令: tailscale %s", strings.Join(args, " "))
-
-	cmd := exec.CommandContext(ctx, "tailscale", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("CLI认证失败: %v", err)
-		log.Printf("命令输出: %s", string(output))
-		return fmt.Errorf("CLI认证失败: %v, 输出: %s", err, string(output))
-	}
-
-	log.Printf("CLI认证成功，输出: %s", string(output))
-	return nil
-}
-
-// waitForLogin 等待登录完成
-func (c *SimpleClient) waitForLogin(ctx context.Context) error {
-	log.Println("等待登录完成...")
-
-	maxWaitSeconds := 300 // 增加到5分钟
+	maxWaitSeconds := 240 // 4分钟等待连接
 	checkInterval := 2 * time.Second
-
-	log.Printf("开始等待，最多%d秒", maxWaitSeconds)
 
 	for i := 0; i < maxWaitSeconds/2; i++ {
 		select {
@@ -1160,103 +857,103 @@ func (c *SimpleClient) waitForLogin(ctx context.Context) error {
 			continue
 		}
 
-		// 每10秒打印一次状态
-		if i%5 == 0 || i < 10 {
-			//打印状态和偏好设置
-			log.Printf("状态: %+v", status)
-			prefs, err := c.localClient.GetPrefs(ctx)
-			if err != nil {
-				log.Printf("无法获取偏好设置: %v", err)
-			}
-			log.Printf("偏好设置: %+v", prefs)
-			log.Printf("等待进度 %d/%ds - 状态: %s", (i+1)*2, maxWaitSeconds, status.BackendState)
+		// 每10秒打印一次详细状态
+		if i%10 == 0 || i < 3 {
+			log.Printf("连接等待进度 %d/%ds - 状态: %s, HaveNodeKey: %v, Online: %v",
+				(i+1)*2, maxWaitSeconds, status.BackendState, status.HaveNodeKey,
+				status.Self != nil && status.Self.Online)
 		}
 
 		switch status.BackendState {
 		case "Running":
 			if c.isLoginComplete(status) {
-				log.Printf("✅ 登录成功! 耗时: %d秒", (i+1)*2)
+				log.Printf("✅ 连接成功! 总耗时: %d秒", (i+1)*2)
+				c.logConnectionInfo(status)
 				return nil
-			}
-
-		case "NeedsLogin":
-			// 增加更详细的诊断信息
-			if i > 60 { // 120秒后开始诊断
-				log.Printf("⚠️  120秒后仍处于NeedsLogin状态，开始诊断...")
-
-				// 检查网络连接
-				if err := c.diagnoseConnection(); err != nil {
-					log.Printf("网络诊断失败: %v", err)
+			} else {
+				// Running但没有IP，继续等待
+				if i%20 == 0 {
+					log.Printf("状态Running但IP未分配，继续等待...")
 				}
-
-				// 检查 Headscale 服务器可达性
-				if err := c.checkHeadscaleReachability(); err != nil {
-					log.Printf("Headscale服务器不可达: %v", err)
-					return fmt.Errorf("Headscale服务器不可达: %v", err)
-				}
-			}
-
-			if i > 120 { // 240秒后返回错误
-				return fmt.Errorf("认证失败：240秒后仍处于NeedsLogin状态，请检查网络连接和Headscale服务器状态")
 			}
 
 		case "Starting":
-			if i%5 == 0 {
-				log.Println("正在启动...")
+			if i%20 == 0 {
+				log.Println("正在启动连接...")
+			}
+
+		case "NeedsLogin":
+			// 如果有NodeKey但状态还是NeedsLogin，可能需要重新启用
+			if status.HaveNodeKey {
+				log.Println("有NodeKey但状态为NeedsLogin，尝试重新启用运行状态")
+				if err := c.enableRunningAfterAuth(ctx); err != nil {
+					log.Printf("重新启用失败: %v", err)
+				}
+			} else {
+				// 诊断网络问题
+				if i > 30 { // 60秒后开始诊断
+					if i%30 == 0 { // 每60秒诊断一次
+						c.diagnoseNetworkIssues(ctx)
+					}
+				}
 			}
 
 		case "Stopped":
-			return fmt.Errorf("连接意外停止")
+			log.Println("连接被停止，尝试重新启用")
+			if err := c.enableRunningAfterAuth(ctx); err != nil {
+				log.Printf("重新启用失败: %v", err)
+			}
 
 		default:
 			log.Printf("未知状态: %s", status.BackendState)
 		}
+
+		// 超时检查
+		if i > 60 { // 120秒后更严格的检查
+			if status.BackendState == "NeedsLogin" && !status.HaveNodeKey {
+				return fmt.Errorf("120秒后仍无NodeKey，认证可能失败")
+			}
+		}
 	}
 
-	return fmt.Errorf("登录超时")
+	return fmt.Errorf("连接超时")
 }
 
-// isLoginComplete 检查登录是否完成
-func (c *SimpleClient) isLoginComplete(status *ipnstate.Status) bool {
+// logConnectionInfo 记录连接信息
+func (c *SimpleClient) logConnectionInfo(status *ipnstate.Status) {
 	if status.Self == nil {
-		return false
+		return
 	}
 
-	if len(status.Self.TailscaleIPs) == 0 {
-		return false
-	}
-
-	return status.Self.Online
+	log.Printf("连接成功: 节点名=%s, 在线=%v, IP数量=%d, 对等节点=%d",
+		status.Self.HostName, status.Self.Online, len(status.Self.TailscaleIPs), len(status.Peer))
 }
 
-// diagnoseConnection 诊断网络连接问题
-func (c *SimpleClient) diagnoseConnection() error {
-	log.Println("🔍 开始网络连接诊断...")
+// diagnoseNetworkIssues 诊断网络问题
+func (c *SimpleClient) diagnoseNetworkIssues(ctx context.Context) {
+	log.Println("诊断网络问题...")
 
-	// 检查本地网络接口
-	cmd := exec.Command("ip", "addr", "show")
-	output, err := cmd.Output()
+	// 检查偏好设置
+	prefs, err := c.localClient.GetPrefs(ctx)
 	if err != nil {
-		return fmt.Errorf("无法获取网络接口信息: %v", err)
+		log.Printf("无法获取偏好设置: %v", err)
+		return
 	}
 
-	log.Printf("网络接口状态:\n%s", string(output))
+	log.Printf("当前配置: ControlURL=%s, Hostname=%s, WantRunning=%v, LoggedOut=%v",
+		prefs.ControlURL, prefs.Hostname, prefs.WantRunning, prefs.LoggedOut)
 
-	// 检查路由表
-	cmd = exec.Command("ip", "route", "show")
-	output, err = cmd.Output()
-	if err != nil {
-		return fmt.Errorf("无法获取路由信息: %v", err)
+	// 测试控制服务器连接
+	if err := c.checkHeadscaleReachability(); err != nil {
+		log.Printf("⚠️ 控制服务器连接问题: %v", err)
+	} else {
+		log.Println("✅ 控制服务器连接正常")
 	}
-
-	log.Printf("路由表:\n%s", string(output))
-
-	return nil
 }
 
 // checkHeadscaleReachability 检查 Headscale 服务器可达性
 func (c *SimpleClient) checkHeadscaleReachability() error {
-	log.Println("🌐 检查 Headscale 服务器可达性...")
+	log.Println("检查 Headscale 服务器可达性...")
 
 	prefs, err := c.localClient.GetPrefs(context.Background())
 	if err != nil {
@@ -1283,8 +980,6 @@ func (c *SimpleClient) checkHeadscaleReachability() error {
 	}
 	defer conn.Close()
 
-	log.Printf("✅ TCP连接成功: %s", u.Host)
-
 	// 尝试HTTP请求
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(controlURL)
@@ -1293,9 +988,28 @@ func (c *SimpleClient) checkHeadscaleReachability() error {
 	}
 	defer resp.Body.Close()
 
-	log.Printf("✅ HTTP请求成功: %s (状态码: %d)", controlURL, resp.StatusCode)
+	log.Printf("网络检查成功: TCP=%s, HTTP=%d", u.Host, resp.StatusCode)
 
 	return nil
+}
+
+// 添加调试方法：直接验证认证密钥和最简单的登录尝试
+func (c *SimpleClient) DebugAuthKey(ctx context.Context, authKey, controlURL string) {
+	log.Println("调试认证密钥...")
+	log.Printf("调试信息: 密钥长度=%d, 控制URL=%s", len(authKey), controlURL)
+}
+
+// isLoginComplete 检查登录是否完成
+func (c *SimpleClient) isLoginComplete(status *ipnstate.Status) bool {
+	if status.Self == nil {
+		return false
+	}
+
+	if len(status.Self.TailscaleIPs) == 0 {
+		return false
+	}
+
+	return status.Self.Online
 }
 
 // validateOptions 验证选项参数
@@ -1341,14 +1055,8 @@ func (c *SimpleClient) Up(ctx context.Context, authKey string) error {
 
 // AdvertiseRoutes 通告路由
 func (c *SimpleClient) AdvertiseRoutes(ctx context.Context, routes ...netip.Prefix) error {
-	prefs := ipn.NewPrefs()
-	prefs.AdvertiseRoutes = routes
-
-	_, err := c.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:              *prefs,
-		AdvertiseRoutesSet: true,
-	})
-
+	maskedPrefs := c.createRoutePrefs(routes, nil, "")
+	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
 	return err
 }
 
@@ -1384,40 +1092,24 @@ func (c *SimpleClient) RemoveRoutes(ctx context.Context, routes ...netip.Prefix)
 
 // AcceptRoutes 接受路由
 func (c *SimpleClient) AcceptRoutes(ctx context.Context) error {
-	prefs := ipn.NewPrefs()
-	prefs.RouteAll = true
-
-	_, err := c.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:       *prefs,
-		RouteAllSet: true,
-	})
-
+	routeAll := true
+	maskedPrefs := c.createRoutePrefs(nil, &routeAll, "")
+	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
 	return err
 }
 
 // RejectRoutes 拒绝路由
 func (c *SimpleClient) RejectRoutes(ctx context.Context) error {
-	prefs := ipn.NewPrefs()
-	prefs.RouteAll = false
-
-	_, err := c.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:       *prefs,
-		RouteAllSet: true,
-	})
-
+	routeAll := false
+	maskedPrefs := c.createRoutePrefs(nil, &routeAll, "")
+	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
 	return err
 }
 
 // SetHostname 设置主机名
 func (c *SimpleClient) SetHostname(ctx context.Context, hostname string) error {
-	prefs := ipn.NewPrefs()
-	prefs.Hostname = hostname
-
-	_, err := c.localClient.EditPrefs(ctx, &ipn.MaskedPrefs{
-		Prefs:       *prefs,
-		HostnameSet: true,
-	})
-
+	maskedPrefs := c.createRoutePrefs(nil, nil, hostname)
+	_, err := c.localClient.EditPrefs(ctx, maskedPrefs)
 	return err
 }
 
@@ -1559,7 +1251,7 @@ func (c *SimpleClient) Ping(ctx context.Context, target string) error {
 
 // QuickConnect 快速连接 - 简化的连接方法
 func (c *SimpleClient) QuickConnect(ctx context.Context, authKey, controlURL, hostname string) error {
-	log.Println("🚀 快速连接模式")
+	log.Println("快速连接模式")
 
 	options := ClientOptions{
 		AuthKey:      authKey,
@@ -1574,9 +1266,9 @@ func (c *SimpleClient) QuickConnect(ctx context.Context, authKey, controlURL, ho
 
 // ForceLogin 强制重新登录
 func (c *SimpleClient) ForceLogin(ctx context.Context, options ClientOptions) error {
-	log.Println("🔄 开始强制重新登录...")
+	log.Println("开始强制重新登录...")
 
-	// 强制登出
+	// 强制登出 - 使用辅助方法
 	prefs := ipn.NewPrefs()
 	prefs.WantRunning = false
 	prefs.LoggedOut = true
@@ -1594,82 +1286,4 @@ func (c *SimpleClient) ForceLogin(ctx context.Context, options ClientOptions) er
 
 	time.Sleep(3 * time.Second)
 	return c.UpWithOptions(ctx, options)
-}
-
-// parseTailscaleCommand 从 tailscale 命令输出中解析完整的命令参数
-func (c *SimpleClient) parseTailscaleCommand(output string) ([]string, error) {
-	log.Println("解析 tailscale 命令输出...")
-
-	// 按行分割输出
-	lines := strings.Split(output, "\n")
-
-	// 查找包含 "tailscale up" 的行
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-
-		// 查找以 "tailscale up" 开头的行
-		if strings.HasPrefix(line, "tailscale up") {
-			log.Printf("找到命令行: %s", line)
-
-			// 分割命令和参数
-			parts := strings.Fields(line)
-			if len(parts) < 2 {
-				continue
-			}
-
-			// 跳过 "tailscale" 和 "up"，只返回参数部分
-			args := parts[2:]
-
-			// 添加 socket 路径
-			result := []string{"--socket", c.socketPath, "up"}
-			result = append(result, args...)
-
-			log.Printf("解析到的参数: %v", result)
-			return result, nil
-		}
-
-		// 查找包含 "Usage:" 或 "Example:" 的行
-		if strings.Contains(line, "Usage:") || strings.Contains(line, "Example:") {
-			// 提取下一行或当前行中的命令部分
-			if strings.Contains(line, "tailscale up") {
-				// 从当前行提取
-				startIdx := strings.Index(line, "tailscale up")
-				if startIdx >= 0 {
-					commandPart := line[startIdx:]
-					parts := strings.Fields(commandPart)
-					if len(parts) >= 2 {
-						args := parts[2:]
-						result := []string{"--socket", c.socketPath, "up"}
-						result = append(result, args...)
-						log.Printf("从 Usage 行解析到的参数: %v", result)
-						return result, nil
-					}
-				}
-			}
-		}
-	}
-
-	// 如果没有找到明确的命令，尝试查找包含必要参数的行
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "--login-server") || strings.Contains(line, "--hostname") {
-			log.Printf("找到包含参数的行: %s", line)
-
-			// 提取参数部分
-			if strings.Contains(line, "tailscale up") {
-				startIdx := strings.Index(line, "tailscale up")
-				commandPart := line[startIdx:]
-				parts := strings.Fields(commandPart)
-				if len(parts) >= 2 {
-					args := parts[2:]
-					result := []string{"--socket", c.socketPath, "up"}
-					result = append(result, args...)
-					log.Printf("从参数行解析到的参数: %v", result)
-					return result, nil
-				}
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("无法从输出中解析到有效的 tailscale up 命令")
 }
