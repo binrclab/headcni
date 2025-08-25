@@ -1,0 +1,197 @@
+# =============================================================================
+# HeadCNI Helm Chart Values Configuration
+# =============================================================================
+# This file defines all configuration options for HeadCNI, organized by functional modules
+
+# =============================================================================
+# 1. Container Image Configuration
+# =============================================================================
+image:
+  # Image repository address
+  # Type: string | Required: true | Example: "binrc/headcni:latest"
+  repository: "binrc/headcni:latest"
+  
+  # Image pull policy: Always, IfNotPresent, Never
+  # Type: string | Default: "IfNotPresent"
+  pullPolicy: Always
+
+# =============================================================================
+# 2. Core Configuration
+# =============================================================================
+config:
+  # =============================================================================
+  # 2.1 HeadScale Configuration
+  # =============================================================================
+  # HeadScale is an open-source control server for Tailscale
+  # - url: HeadScale server URL | Type: string | Required: true
+  # - authKey: Authentication key (via Secret) | Type: string | Default: ""
+  headscale:
+    url: "https://headscale.example.com:8080"      # HeadScale server URL
+    authKey: "YOUR_AUTH_KEY_HERE"                      # Authentication key (get from secret)
+  
+  # =============================================================================
+  # 2.2 Tailscale Configuration
+  # =============================================================================
+  # Tailscale client configuration
+  # 
+  # REQUIRED PARAMETERS:
+  # - mode: Operation mode: "host" or "daemon" | Type: string | Required: true
+  # 
+  # DAEMON MODE PARAMETERS (only when mode="daemon"):
+  # - url: HeadScale server URL | Type: string | Required: true
+  # - socket: Unix socket configuration | Type: object
+  #   - name: Socket file name | Type: string | Default: "headcni_tailscale.sock"
+  #   - path: Socket file path | Type: string | Default: "/var/run/headcni/headcni_tailscale.sock"
+  # - hostname: Node hostname configuration | Type: object
+  #   - prefix: Hostname prefix | Type: string | Default: "headcni-pod"
+  #   - type: Hostname type: "hostname" or "fqdn" | Type: string | Default: "hostname"
+  # - mtu: Maximum Transmission Unit | Type: integer | Default: 1280 | Range: 1280-1500
+  # - acceptDNS: Accept DNS settings from HeadScale | Type: boolean | Default: true
+  # - user: Tailscale username | Type: string | Default: "server"
+  # - tags: Node tags for access control | Type: array
+  tailscale:
+    mode: "daemon"               # Operation mode: host or daemon
+    url: "https://headscale.example.com:8080"  # HeadScale server URL for daemon mode
+    
+    socket:
+      name: "headcni_tailscale.sock"      # Socket file name
+      path: "/var/run/headcni/headcni_tailscale.sock"  # Socket file path
+    
+    hostname:
+      prefix: "headcni-pod"      # Hostname prefix
+      type: "hostname"           # Hostname type: hostname or fqdn
+    
+    mtu: 1280                    # Maximum Transmission Unit
+    acceptDNS: false              # Accept DNS settings from HeadScale
+    
+    user: "server"               # Tailscale username
+    tags:                        # Node tags for access control
+      - "tag:control-server"
+  
+  # =============================================================================
+  # 2.3 Network Configuration
+  # =============================================================================
+  # Kubernetes cluster network configuration
+  # 
+  # REQUIRED PARAMETERS:
+  # - podCIDR: Base Pod CIDR for the cluster | Type: string | Required: true | Format: CIDR
+  # - serviceCIDR: Service CIDR for Kubernetes services | Type: string | Required: true | Format: CIDR
+  # 
+  # OPTIONAL PARAMETERS:
+  # - mtu: Network interface MTU | Type: integer | Default: 1280 | Range: 1280-1500
+  # - enableIPv6: Enable IPv6 support | Type: boolean | Default: false
+  # - enableNetworkPolicy: Enable network policy support | Type: boolean | Default: true
+  network:
+    podCIDR: "10.42.0.0/16"     # Base Pod CIDR for the cluster (controlled by k8s/k3s)
+    serviceCIDR: "10.43.0.0/16"  # Service CIDR for Kubernetes services
+    mtu: 1280                    # Network interface MTU
+    enableIPv6: false            # Enable IPv6 support
+    enableNetworkPolicy: true    # Enable network policy support
+    
+  # =============================================================================
+  # 2.4 IPAM Configuration
+  # =============================================================================
+  # IP address management configuration
+  # - type: IPAM type: "host-local" or "headcni-ipam" | Type: string | Required: true
+  # - strategy: IP allocation strategy: "sequential", "random", "dense-pack" | Type: string | Default: "sequential"
+  # - gcInterval: Garbage collection interval | Type: string | Default: "1h"
+  ipam:
+    type: "host-local"           # IPAM type: host-local or headcni-ipam
+    strategy: "sequential"       # IP allocation strategy
+    gcInterval: "1h"             # Garbage collection interval
+  
+  # =============================================================================
+  # 2.5 DNS Configuration
+  # =============================================================================
+  # DNS resolution configuration
+  dns:
+    # MagicDNS configuration
+    # - enabled: Enable MagicDNS | Type: boolean | Default: true
+    # - nameservers: DNS server list | Type: array | Default: ["10.2.0.1"]
+    # - searchDomains: DNS search domains | Type: array | Default: ["c.binrc.com"]
+    # - options: DNS resolution options | Type: array | Default: ["ndots:5"]
+    magicDNS:
+      enabled: false              # Enable MagicDNS
+      nameservers:               # DNS server list
+        - "10.2.0.1"
+      searchDomains:             # DNS search domains
+        - "c.binrc.com"
+      options:                   # DNS resolution options
+        - "ndots:5"
+      
+  # =============================================================================
+  # 2.6 Monitoring Configuration
+  # =============================================================================
+  # Monitoring and metrics collection configuration
+  # - enabled: Enable monitoring | Type: boolean | Default: true
+  # - port: Monitoring port | Type: integer | Default: 8080 | Range: 1-65535
+  # - path: Metrics path | Type: string | Default: "/metrics"
+  monitoring:
+    enabled: true                # Enable monitoring
+    port: 8080                   # Monitoring port
+    path: "/metrics"             # Metrics path
+  
+  logging:
+    level: "info"
+    format: "json"
+    output: "stdout"
+
+# =============================================================================
+# 3. Kubernetes Resource Configuration
+# =============================================================================
+
+# ServiceAccount configuration
+# - create: Create ServiceAccount | Type: boolean | Default: true
+# - name: ServiceAccount name | Type: string | Default: ""
+serviceAccount:
+  create: true                   # Create ServiceAccount
+  name: ""                       # ServiceAccount name (leave empty for default)
+
+# Resource limits configuration
+resources:
+  # Manager component resource requirements
+  # - requests: Resource requests | Type: object
+  #   - cpu: CPU request | Type: string | Default: "100m"
+  #   - memory: Memory request | Type: string | Default: "128Mi"
+  # - limits: Resource limits | Type: object
+  #   - cpu: CPU limit | Type: string | Default: "200m"
+  #   - memory: Memory limit | Type: string | Default: "256Mi"
+  manager:
+    requests:
+      cpu: 100m                  # CPU request
+      memory: 128Mi              # Memory request
+    
+    limits:
+      cpu: 200m                  # CPU limit
+      memory: 256Mi              # Memory limit
+      
+  # Metrics collection component resource requirements
+  # - requests: Resource requests | Type: object
+  #   - cpu: CPU request | Type: string | Default: "50m"
+  #   - memory: Memory request | Type: string | Default: "64Mi"
+  # - limits: Resource limits | Type: object
+  #   - cpu: CPU limit | Type: string | Default: "100m"
+  #   - memory: Memory limit | Type: string | Default: "128Mi"
+  metrics:
+    requests:
+      cpu: 50m                   # CPU request
+      memory: 64Mi               # Memory request
+    
+    limits:
+      cpu: 100m                  # CPU limit
+      memory: 128Mi              # Memory limit
+
+# =============================================================================
+# 4. Scheduling Configuration
+# =============================================================================
+# - nodeSelector: Node selector for deployment nodes | Type: object | Default: {}
+# - tolerations: Tolerations for tainted nodes | Type: array | Default: [{"operator": "Exists", "effect": "NoSchedule"}]
+# - priorityClassName: Priority class name | Type: string | Default: "system-node-critical"
+
+nodeSelector: {}                  # Node selector for specifying deployment nodes
+
+tolerations:                      # Tolerations for running on tainted nodes
+  - operator: Exists
+    effect: NoSchedule
+
+priorityClassName: "system-node-critical"  # Priority class name
