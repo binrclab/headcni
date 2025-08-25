@@ -820,7 +820,7 @@ kubectl logs -n kube-system -l k8s-app=kube-proxy -f --tail=100
 kubectl logs -n ingress-nginx -l app.kubernetes.io/name=ingress-nginx -f --tail=100
 
 # HeadCNI IPAM 日志
-kubectl logs -n kube-system -l app=headcni-ipam -f --tail=100
+kubectl logs -n kube-system -l app=host-local -f --tail=100
 
 # 系统日志
 journalctl -u kubelet -f

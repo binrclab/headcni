@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
@@ -35,17 +37,100 @@ func NewNetworkManager(config *Config) (*NetworkManager, error) {
 	}, nil
 }
 
+// CheckSystemResources 检查系统资源状态
+func (nm *NetworkManager) CheckSystemResources() error {
+	// 检查可用的网络接口索引
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list network links: %v", err)
+	}
+
+	// 检查是否有过多的网络接口
+	if len(links) > 1000 {
+		klog.Warningf("Large number of network interfaces detected: %d", len(links))
+	}
+
+	// 检查是否有重复的接口名称
+	interfaceNames := make(map[string]bool)
+	for _, link := range links {
+		name := link.Attrs().Name
+		if interfaceNames[name] {
+			klog.Warningf("Duplicate interface name detected: %s", name)
+		}
+		interfaceNames[name] = true
+	}
+
+	// 检查系统限制
+	if err := nm.checkSystemLimits(); err != nil {
+		return fmt.Errorf("system limits check failed: %v", err)
+	}
+
+	return nil
+}
+
+// checkSystemLimits 检查系统限制
+func (nm *NetworkManager) checkSystemLimits() error {
+	// 检查 /proc/sys/net/core/dev_weight 值
+	devWeightPath := "/proc/sys/net/core/dev_weight"
+	if data, err := os.ReadFile(devWeightPath); err == nil {
+		klog.V(4).Infof("Network device weight: %s", string(data))
+	}
+
+	// 检查 /proc/sys/net/core/netdev_budget 值
+	budgetPath := "/proc/sys/net/core/netdev_budget"
+	if data, err := os.ReadFile(budgetPath); err == nil {
+		klog.V(4).Infof("Network device budget: %s", string(data))
+	}
+
+	return nil
+}
+
 // CreateVethPair 创建 veth pair
 func (nm *NetworkManager) CreateVethPair(netnsPath, containerIfName, hostIfName string) error {
+	// 验证接口名称
+	if containerIfName == "" || hostIfName == "" {
+		return fmt.Errorf("invalid interface names: container=%s, host=%s", containerIfName, hostIfName)
+	}
+
+	// 验证网络命名空间路径
+	if netnsPath == "" {
+		return fmt.Errorf("invalid network namespace path")
+	}
+
+	// 检查网络命名空间是否存在
+	if _, err := os.Stat(netnsPath); os.IsNotExist(err) {
+		return fmt.Errorf("network namespace %s does not exist", netnsPath)
+	}
+
+	// 检查系统资源状态
+	if err := nm.CheckSystemResources(); err != nil {
+		klog.Warningf("System resources check failed: %v", err)
+		// 继续执行，但记录警告
+	}
+
+	// 记录创建前的系统状态
+	klog.V(4).Infof("Creating veth pair: container=%s, host=%s, netns=%s",
+		containerIfName, hostIfName, netnsPath)
+
+	// 检查当前网络接口数量
+	links, err := netlink.LinkList()
+	if err == nil {
+		klog.V(4).Infof("Current network interfaces count: %d", len(links))
+	}
+
 	// 如果同名的veth已经存在了，删除
 	if oldHostVeth, err := netlink.LinkByName(hostIfName); err == nil {
+		klog.V(4).Infof("Found existing host veth %s, deleting...", hostIfName)
 		if err = netlink.LinkDel(oldHostVeth); err != nil {
 			return fmt.Errorf("failed to delete old hostVeth %s: %v", hostIfName, err)
 		}
+		// 等待一下确保接口完全删除
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	// 在容器网络命名空间中创建veth pair
 	return ns.WithNetNSPath(netnsPath, func(hostNS ns.NetNS) error {
+		// 创建 veth pair 配置
 		veth := &netlink.Veth{
 			LinkAttrs: netlink.LinkAttrs{
 				Name: containerIfName,
@@ -54,10 +139,61 @@ func (nm *NetworkManager) CreateVethPair(netnsPath, containerIfName, hostIfName 
 			PeerName: hostIfName,
 		}
 
-		// 创建veth pair
-		if err := netlink.LinkAdd(veth); err != nil {
-			return fmt.Errorf("failed to create veth pair: %v", err)
+		klog.V(4).Infof("Attempting to create veth pair with MTU: %d", nm.config.MTU)
+
+		// 创建veth pair，添加重试逻辑
+		var err error
+		for retries := 0; retries < 3; retries++ {
+			err = netlink.LinkAdd(veth)
+			if err == nil {
+				break
+			}
+
+			klog.V(4).Infof("Veth creation attempt %d failed: %v", retries+1, err)
+
+			// 如果是接口已存在的错误，尝试删除后重试
+			if strings.Contains(err.Error(), "file exists") || strings.Contains(err.Error(), "already exists") {
+				klog.V(4).Infof("Interface already exists, retrying... (attempt %d/3)", retries+1)
+				// 尝试删除已存在的接口
+				if oldLink, lookupErr := netlink.LinkByName(containerIfName); lookupErr == nil {
+					netlink.LinkDel(oldLink)
+				}
+				if oldLink, lookupErr := netlink.LinkByName(hostIfName); lookupErr == nil {
+					netlink.LinkDel(oldLink)
+				}
+				time.Sleep(200 * time.Millisecond)
+				continue
+			}
+
+			// 如果是数值超出范围的错误，提供更多调试信息
+			if strings.Contains(err.Error(), "numerical result out of range") {
+				klog.Errorf("Numerical result out of range error detected!")
+				klog.Errorf("This usually indicates a system resource exhaustion issue")
+				klog.Errorf("Container interface: %s", containerIfName)
+				klog.Errorf("Host interface: %s", hostIfName)
+				klog.Errorf("Network namespace: %s", netnsPath)
+				klog.Errorf("MTU: %d", nm.config.MTU)
+
+				// 记录当前系统状态
+				if links, listErr := netlink.LinkList(); listErr == nil {
+					klog.Errorf("Current network interfaces: %d", len(links))
+					for i, link := range links {
+						if i < 5 { // 只记录前5个
+							klog.Errorf("  Interface %d: %s (index: %d)", i, link.Attrs().Name, link.Attrs().Index)
+						}
+					}
+				}
+			}
+
+			// 其他错误直接返回
+			break
 		}
+
+		if err != nil {
+			return fmt.Errorf("failed to create veth pair after retries: %v", err)
+		}
+
+		klog.V(4).Infof("Veth pair created successfully, configuring interfaces...")
 
 		// 获取宿主机端的veth
 		hostVeth, err := netlink.LinkByName(hostIfName)

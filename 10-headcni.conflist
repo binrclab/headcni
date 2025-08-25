@@ -5,7 +5,7 @@
     {
       "type": "headcni",
       "ipam": {
-        "type": "host-local", # headcni-ipam or host-local
+        "type": "host-local", # host-local
         "dataDir": "/var/lib/headcni/networks/headcni",
         "ranges": [
           [

@@ -1,0 +1,107 @@
+# HeadCNI Daemon Configuration
+# Generated from Helm chart values
+# This is an example of what the generated /opt/headcni/config/daemon.yaml will look like
+
+daemon:
+  logLevel: info
+  hostNetwork: true
+
+headscale:
+  url: "https://headscale.example.com"
+  authKey: ""
+  timeout: "30s"
+  retries: 3
+
+tailscale:
+  mode: "daemon"
+  url: "https://headscale.example.com"
+  socket:
+    path: "/var/run/headcni/headcni_tailscale.sock"
+    name: "headcni_tailscale.sock"
+  mtu: 1280
+  acceptDNS: false
+  hostname:
+    prefix: "headcni-pod"
+    type: "hostname"
+  user: "server"
+  interfaceName: "headcni01"
+  tags:
+    - "tag:control-server"
+    - "tag:headcni"
+
+network:
+  podCIDR:
+    base: "10.42.0.0/16"
+    perNode: "/24"
+  serviceCIDR: "10.43.0.0/16"
+  mtu: 1280
+  enableIPv6: false
+  enableNetworkPolicy: true
+
+ipam:
+  type: "host-local"
+  strategy: "sequential"
+  gcInterval: "1h"
+  subnets: []
+
+dns:
+  magicDNS:
+    enabled: true
+    nameservers:
+      - "8.8.8.8"
+      - "8.8.4.4"
+    searchDomains:
+      - "cluster.local"
+    options:
+      - "ndots:5"
+      - "timeout:2"
+  custom:
+    enabled: false
+    nameservers: []
+    searchDomains: []
+    options: []
+
+monitoring:
+  enabled: true
+  port: 9001
+  path: "/metrics"
+
+logging:
+  level: "info"
+  format: "json"
+  output: "stdout"
+  file:
+    enabled: false
+    path: "/var/log/headcni/headcni.log"
+    maxSize: "100MB"
+    maxBackups: 3
+    maxAge: "7d"
+
+security:
+  tls:
+    enabled: false
+    certFile: ""
+    keyFile: ""
+    caFile: ""
+  auth:
+    enabled: false
+    type: "token"
+    token: ""
+  networkPolicy:
+    enabled: true
+    ingress: []
+    egress: []
+
+performance:
+  connectionPool:
+    maxConnections: 100
+    maxIdleConnections: 10
+    connectionTimeout: "30s"
+    idleTimeout: "90s"
+  cache:
+    enabled: true
+    size: "100MB"
+    ttl: "1h"
+  concurrency:
+    maxWorkers: 10
+    queueSize: 100 

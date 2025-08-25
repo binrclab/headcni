@@ -1,10 +1,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net"
-	"time"
 
 	"github.com/binrclab/headcni/pkg/ipam"
 	"github.com/containernetworking/cni/pkg/skel"
@@ -40,9 +38,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 
 	klog.Infof("CNI ADD called for container %s", args.ContainerID)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
 	// 解析容器和 Pod 信息
 	podInfo, err := parsePodInfo(args.Args)
 	if err != nil {
@@ -76,21 +71,6 @@ func cmdAdd(args *skel.CmdArgs) error {
 	var allocation *ipam.IPAllocation
 
 	switch plugin.config.IPAM.Type {
-	case "headcni-ipam":
-		// 使用自定义 IPAM
-		if plugin.ipamManager == nil {
-			return fmt.Errorf("IPAM manager not initialized for type: %s", plugin.config.IPAM.Type)
-		}
-		allocation, err = plugin.ipamManager.AllocateIP(
-			ctx,
-			podInfo.namespace,
-			podInfo.podName,
-			args.ContainerID,
-		)
-		if err != nil {
-			return fmt.Errorf("IPAM allocation failed: %v", err)
-		}
-
 	case "host-local":
 		// 使用 host-local IPAM
 		if plugin.hostLocal == nil {
@@ -102,7 +82,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 		}
 
 	default:
-		return fmt.Errorf("unsupported IPAM type: %s (supported: host-local, headcni-ipam)", plugin.config.IPAM.Type)
+		return fmt.Errorf("unsupported IPAM type: %s (supported: host-local, host-local)", plugin.config.IPAM.Type)
 	}
 
 	// 配置 Pod 网络

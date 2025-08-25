@@ -359,7 +359,7 @@ func generateSimplifiedConfig() string {
   "service_cidr": "10.96.0.0/16",
   
   "ipam": {
-    "type": "headcni-ipam",
+    "type": "host-local",
     "subnet": "10.244.0.0/24",
     "gateway": "10.244.0.1",
     "allocation_strategy": "sequential"

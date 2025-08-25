@@ -38,8 +38,7 @@ cd headcni
 helm upgrade --install headcni ./chart \
   --namespace kube-system \
   --set config.headscale.url=https://headscale.company.com \
-  --set config.headscale.authKey=YOUR_AUTH_KEY \
-  --set config.ipam.type=headcni-ipam
+  --set config.headscale.authKey=YOUR_AUTH_KEY
 ```
 
 #### 方式二：手动部署
@@ -63,7 +62,6 @@ make install
 
 # 或者手动安装
 sudo cp bin/headcni /opt/cni/bin/
-sudo cp bin/headcni-ipam /opt/cni/bin/
 sudo cp bin/headcni-daemon /opt/cni/bin/
 sudo cp 10-headcni.conflist /etc/cni/net.d/
 ```
@@ -146,7 +144,6 @@ HeadCNI 支持 MagicDNS 配置，提供更简洁的 DNS 管理：
 HeadCNI 支持两种 IPAM 类型：
 
 1. **host-local**：标准 CNI IPAM 插件，简单高效
-2. **headcni-ipam**：自定义 IPAM 插件，支持高级功能
 
 ### 🔐 API Key 安全配置
 
@@ -248,7 +245,6 @@ headcni/
 ├── cmd/                    # 命令行工具
 │   ├── headcni/           # 主 CNI 插件
 │   ├── headcni-daemon/    # 守护进程组件
-│   ├── headcni-ipam/      # IPAM 插件
 │   └── cli/               # CLI 工具
 ├── pkg/                   # 核心包
 │   ├── daemon/           # 守护进程逻辑

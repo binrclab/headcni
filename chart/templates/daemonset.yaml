@@ -34,9 +34,7 @@ spec:
         - |
           # 1. Install necessary CNI binaries to host
           cp /opt/cni/bin/headcni /host/opt/cni/bin/
-          cp /opt/cni/bin/headcni-ipam /host/opt/cni/bin/
           chmod +x /host/opt/cni/bin/headcni
-          chmod +x /host/opt/cni/bin/headcni-ipam
           
           # 2. Prepare configuration in container
           mkdir -p /opt/headcni/config

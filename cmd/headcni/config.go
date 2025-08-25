@@ -68,9 +68,9 @@ func loadConfig(stdinData []byte) (*CNIPlugin, error) {
 		return nil, fmt.Errorf("invalid pod CIDR %s: %v", podCIDRStr, err)
 	}
 
-	// 创建 IPAM Manager（仅用于 headcni-ipam 类型）
+	// 创建 IPAM Manager（仅用于 host-local 类型）
 	var ipamManager *ipam.IPAMManager
-	if conf.IPAM.Type == "headcni-ipam" {
+	if conf.IPAM.Type == "host-local" {
 		ipamManager, err = ipam.NewIPAMManager(nodeName, podCIDR)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create IPAM manager: %v", err)

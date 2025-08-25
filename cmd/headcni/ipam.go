@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"os"
@@ -201,10 +200,6 @@ func (h *HostLocalIPAM) loadExistingAllocations() error {
 // releaseIP 释放 IP 地址
 func (p *CNIPlugin) releaseIP(podInfo *PodInfo, containerID string) {
 	switch p.config.IPAM.Type {
-	case "headcni-ipam":
-		if p.ipamManager != nil {
-			p.ipamManager.ReleaseIP(context.Background(), podInfo.namespace, podInfo.podName)
-		}
 	case "host-local":
 		if p.hostLocal != nil {
 			p.hostLocal.ReleaseIP(containerID)

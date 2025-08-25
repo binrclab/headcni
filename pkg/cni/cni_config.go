@@ -125,7 +125,7 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 		}
 	} else {
 		ipamConfig = &IPAMConfig{
-			Type: "headcni-ipam",
+			Type: "host-local",
 			Ranges: [][]map[string]string{
 				{
 					{"subnet": localCIDR},

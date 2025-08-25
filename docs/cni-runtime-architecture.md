@@ -9,7 +9,7 @@ graph TB
             Kubelet1[Kubelet]
             CNI1[headcni 插件]
             Daemon1[headcni-daemon]
-            IPAM1[headcni-ipam]
+            IPAM1[host-local]
             Veth1[veth 对]
             TS1[Tailscale 接口]
         end
@@ -18,7 +18,7 @@ graph TB
             Kubelet2[Kubelet]
             CNI2[headcni 插件]
             Daemon2[headcni-daemon]
-            IPAM2[headcni-ipam]
+            IPAM2[host-local]
             Veth2[veth 对]
             TS2[Tailscale 接口]
         end
@@ -27,7 +27,7 @@ graph TB
             KubeletN[Kubelet]
             CNIN[headcni 插件]
             DaemonN[headcni-daemon]
-            IPAMN[headcni-ipam]
+            IPAMN[host-local]
             VethN[veth 对]
             TSN[Tailscale 接口]
         end

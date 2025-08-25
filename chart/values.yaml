@@ -92,11 +92,11 @@ config:
   # 2.4 IPAM Configuration
   # =============================================================================
   # IP address management configuration
-  # - type: IPAM type: "host-local" or "headcni-ipam" | Type: string | Required: true
+  # - type: IPAM type: "host-local" | Type: string | Required: true
   # - strategy: IP allocation strategy: "sequential", "random", "dense-pack" | Type: string | Default: "sequential"
   # - gcInterval: Garbage collection interval | Type: string | Default: "1h"
   ipam:
-    type: "host-local"           # IPAM type: host-local or headcni-ipam
+    type: "host-local"           # IPAM type: host-local
     strategy: "sequential"       # IP allocation strategy
     gcInterval: "1h"             # Garbage collection interval
   

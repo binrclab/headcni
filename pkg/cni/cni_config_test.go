@@ -127,13 +127,13 @@ func TestGenerateConfigListWithHeadscaleIPAM(t *testing.T) {
 	// 创建配置管理器
 	manager := NewCNIConfigManager(tempDir, "test-headscale.conflist", logging.NewSimpleLogger())
 
-	// 创建测试配置（使用 headcni-ipam）
+	// 创建测试配置（使用 host-local）
 	testConfig := &config.Config{
 		Network: config.NetworkConfig{
 			MTU: 1500,
 		},
 		IPAM: config.IPAMConfig{
-			Type: "headcni-ipam",
+			Type: "host-local",
 		},
 	}
 
@@ -145,8 +145,8 @@ func TestGenerateConfigListWithHeadscaleIPAM(t *testing.T) {
 
 	// 验证 IPAM 类型
 	plugin := configList.Plugins[0]
-	if plugin.IPAM.Type != "headcni-ipam" {
-		t.Errorf("Expected IPAM type headcni-ipam, got %s", plugin.IPAM.Type)
+	if plugin.IPAM.Type != "host-local" {
+		t.Errorf("Expected IPAM type host-local, got %s", plugin.IPAM.Type)
 	}
 
 	// 输出生成的 JSON
@@ -155,7 +155,7 @@ func TestGenerateConfigListWithHeadscaleIPAM(t *testing.T) {
 		t.Fatalf("Failed to marshal config: %v", err)
 	}
 
-	t.Logf("Generated CNI config with headcni-ipam:\n%s", string(jsonData))
+	t.Logf("Generated CNI config with host-local:\n%s", string(jsonData))
 }
 
 func TestConfigListValidation(t *testing.T) {

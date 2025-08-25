@@ -183,7 +183,7 @@ func validateConfig(opts *ConfigOptions) error {
 		// 检查 IPAM 配置
 		if ipam, ok := cniConfig["ipam"].(map[string]interface{}); ok {
 			if ipamType, ok := ipam["type"].(string); ok {
-				if ipamType != "host-local" && ipamType != "headcni-ipam" {
+				if ipamType != "host-local" {
 					return fmt.Errorf("unsupported IPAM type: %s", ipamType)
 				}
 				fmt.Printf("   ✅ IPAM type: %s\n", ipamType)
@@ -261,7 +261,7 @@ func explainConfig(opts *ConfigOptions) error {
 
 	// 显示简化配置示例
 	pterm.DefaultSection.Println("Simplified Configuration Example")
-	pterm.DefaultBox.WithTitle("10-headcni-ipam.conflist").Println(generateSimplifiedConfig())
+	pterm.DefaultBox.WithTitle("10-host-local.conflist").Println(generateSimplifiedConfig())
 
 	// 显示环境变量配置
 	pterm.DefaultSection.Println("Environment Variables Configuration")
@@ -275,7 +275,7 @@ SERVICE_CIDR=10.96.0.0/16
 MTU=1420
 
 # IPAM 配置
-IPAM_TYPE=headcni-ipam
+IPAM_TYPE=host-local
 ALLOCATION_STRATEGY=sequential`
 
 	pterm.DefaultBox.WithTitle("headcni.env").Println(envConfig)

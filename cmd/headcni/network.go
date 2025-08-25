@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/containernetworking/cni/pkg/skel"
 	"github.com/containernetworking/cni/pkg/types"
@@ -16,15 +17,109 @@ import (
 	"github.com/binrclab/headcni/pkg/ipam"
 )
 
+// emergencyCleanup 紧急清理函数，用于处理 veth 创建失败的情况
+func (p *CNIPlugin) emergencyCleanup(containerID, hostVethName, netns string) {
+	klog.Warningf("Performing emergency cleanup for container %s", containerID)
+
+	// 尝试清理可能存在的 veth 接口
+	if hostVethName != "" {
+		if err := p.cleanupVethPair(hostVethName, netns); err != nil {
+			klog.Errorf("Emergency cleanup failed for veth %s: %v", hostVethName, err)
+		}
+	}
+
+	// 尝试清理可能存在的路由
+	if err := p.cleanupHostRoute(hostVethName); err != nil {
+		klog.Errorf("Emergency cleanup failed for host route: %v", err)
+	}
+
+	// 记录系统状态信息用于调试
+	p.logSystemState(containerID)
+}
+
+// logSystemState 记录系统状态信息用于调试
+func (p *CNIPlugin) logSystemState(containerID string) {
+	klog.Infof("=== System State Debug Info for Container %s ===", containerID)
+
+	// 列出所有网络接口
+	links, err := netlink.LinkList()
+	if err != nil {
+		klog.Errorf("Failed to list network links: %v", err)
+	} else {
+		klog.Infof("Total network interfaces: %d", len(links))
+		// 只记录前10个接口避免日志过多
+		for i, link := range links {
+			if i >= 10 {
+				klog.Infof("... and %d more interfaces", len(links)-10)
+				break
+			}
+			klog.Infof("Interface %d: %s (type: %s, index: %d)",
+				i, link.Attrs().Name, link.Type(), link.Attrs().Index)
+		}
+	}
+
+	// 检查系统资源 - 直接调用方法
+	if p.networkMgr != nil {
+		if err := p.networkMgr.CheckSystemResources(); err != nil {
+			klog.Warningf("System resources check failed: %v", err)
+		}
+	}
+
+	klog.Infof("=== End System State Debug Info ===")
+}
+
 // setupPodNetwork 配置Pod网络
 func (p *CNIPlugin) setupPodNetwork(args *skel.CmdArgs, allocation *ipam.IPAllocation) (*current.Result, error) {
+	// 验证输入参数
+	if args == nil {
+		return nil, fmt.Errorf("invalid args: args is nil")
+	}
+
+	if args.ContainerID == "" {
+		return nil, fmt.Errorf("invalid args: container ID is empty")
+	}
+
+	if args.Netns == "" {
+		return nil, fmt.Errorf("invalid args: network namespace path is empty")
+	}
+
+	if allocation == nil {
+		return nil, fmt.Errorf("invalid allocation: allocation is nil")
+	}
+
+	if allocation.IP == nil {
+		return nil, fmt.Errorf("invalid allocation: IP address is nil")
+	}
+
 	// 1. 创建 veth pair
 	hostVethName := vethName(args.ContainerID)
 
+	klog.Infof("Creating veth pair for container %s: host=%s, container=eth0",
+		args.ContainerID, hostVethName)
+
+	// 添加调试信息
+	klog.V(4).Infof("Container ID: %s", args.ContainerID)
+	klog.V(4).Infof("Network namespace: %s", args.Netns)
+	klog.V(4).Infof("Generated host veth name: %s", hostVethName)
+	klog.V(4).Infof("Allocated IP: %s", allocation.IP.String())
+
 	err := p.networkMgr.CreateVethPair(args.Netns, "eth0", hostVethName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create veth pair: %v", err)
+		// 记录详细错误信息
+		klog.Errorf("Veth pair creation failed: %v", err)
+		klog.Errorf("Container ID: %s", args.ContainerID)
+		klog.Errorf("Host veth name: %s", hostVethName)
+		klog.Errorf("Network namespace: %s", args.Netns)
+
+		// 执行紧急清理
+		p.emergencyCleanup(args.ContainerID, hostVethName, args.Netns)
+
+		// 提供更详细的错误信息
+		return nil, fmt.Errorf("failed to create veth pair (container=%s, host=%s, netns=%s): %v",
+			"eth0", hostVethName, args.Netns, err)
 	}
+
+	klog.Infof("Successfully created veth pair for container %s", args.ContainerID)
 
 	// 2. 配置 Pod 网络命名空间
 	var result *current.Result
@@ -68,12 +163,22 @@ func (p *CNIPlugin) setupPodNetwork(args *skel.CmdArgs, allocation *ipam.IPAlloc
 	})
 
 	if err != nil {
-		return nil, err
+		// 清理已创建的 veth pair
+		klog.Warningf("Failed to setup pod network namespace, cleaning up veth pair: %v", err)
+		if cleanupErr := p.cleanupVethPair(hostVethName, args.Netns); cleanupErr != nil {
+			klog.Errorf("Failed to cleanup veth pair after error: %v", cleanupErr)
+		}
+		return nil, fmt.Errorf("failed to setup pod network namespace: %v", err)
 	}
 
 	// 3. 配置宿主机路由
 	err = p.setupHostRouting(allocation.IP, hostVethName)
 	if err != nil {
+		// 清理已创建的 veth pair
+		klog.Warningf("Failed to setup host routing, cleaning up veth pair: %v", err)
+		if cleanupErr := p.cleanupVethPair(hostVethName, args.Netns); cleanupErr != nil {
+			klog.Errorf("Failed to cleanup veth pair after error: %v", cleanupErr)
+		}
 		return nil, fmt.Errorf("failed to setup host routing: %v", err)
 	}
 
@@ -81,8 +186,12 @@ func (p *CNIPlugin) setupPodNetwork(args *skel.CmdArgs, allocation *ipam.IPAlloc
 	if p.config.TailscaleNic != "" {
 		if err := p.setupTailscaleNetwork(allocation); err != nil {
 			klog.Warningf("Failed to setup Tailscale network: %v", err)
+			// Tailscale 配置失败不应阻止 Pod 网络创建
 		}
 	}
+
+	klog.Infof("Successfully configured pod network for container %s with IP %s",
+		args.ContainerID, allocation.IP.String())
 
 	return result, nil
 }
@@ -450,11 +559,42 @@ func (p *CNIPlugin) generateIPv6Address(ipv4 net.IP) net.IP {
 
 // vethName 生成veth接口名
 func vethName(containerID string) string {
-	// 生成 veth 接口名，限制在 15 字符内（Linux 接口名限制）
-	if len(containerID) > 12 {
-		containerID = containerID[:12]
+	// 验证容器ID
+	if containerID == "" {
+		klog.Warningf("Empty container ID, using fallback name")
+		return "vethfallback"
 	}
-	return "veth" + containerID
+
+	// 清理容器ID，移除可能导致问题的字符
+	cleanID := strings.Map(func(r rune) rune {
+		// 只保留字母、数字和连字符
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' {
+			return r
+		}
+		return '-'
+	}, containerID)
+
+	// 生成 veth 接口名，限制在 15 字符内（Linux 接口名限制）
+	// 确保接口名以字母开头（Linux 要求）
+	if len(cleanID) > 11 {
+		cleanID = cleanID[:11]
+	}
+
+	// 如果清理后的ID为空或不是以字母开头，使用默认值
+	if cleanID == "" || !unicode.IsLetter(rune(cleanID[0])) {
+		cleanID = "pod"
+	}
+
+	result := "veth" + cleanID
+
+	// 最终验证：确保接口名不超过15字符且以字母开头
+	if len(result) > 15 {
+		result = result[:15]
+	}
+
+	klog.V(4).Infof("Generated veth name: %s from container ID: %s", result, containerID)
+	return result
 }
 
 // cleanupVethPair 清理veth对

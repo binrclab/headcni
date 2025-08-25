@@ -58,7 +58,7 @@ graph TB
         
         subgraph "HeadCNI 组件"
             CNI_Plugin[headcni 插件]
-            IPAM_Plugin[headcni-ipam 插件]
+            IPAM_Plugin[host-local 插件]
             Daemon[headcni-daemon]
         end
         

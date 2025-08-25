@@ -23,7 +23,7 @@ EXAMPLES_DIR := examples
 PKG_DIR := pkg
 
 # 二进制文件
-BINARIES := headcni headcni-ipam headcni-cli headcni-daemon
+BINARIES := headcni headcni-cli headcni-daemon
 BIN_FILES := $(addprefix $(BIN_DIR)/,$(BINARIES))
 
 # 安装路径
@@ -48,17 +48,15 @@ help:
 	@echo "=================="
 	@echo ""
 	@echo "构建目标:"
-	@echo "  build          - 构建核心组件 (headcni + headcni-ipam)"
-	@echo "  build-ipam     - 构建 headcni-ipam"
+	@echo "  build          - 构建核心组件 (headcni)"
 	@echo "  build-main     - 构建主 CNI 插件"
-	@echo "  build-daemon   - 构建 headcni-daemon (可选)"
-	@echo "  build-daemon   - 构建 headcni-daemon (可选)"
+	@echo "  build-daemon   - 构建 headcni-daemon"
 	@echo "  clean          - 清理构建文件"
 	@echo ""
 	@echo "安装目标:"
 	@echo "  install        - 安装核心组件到系统"
 	@echo "  install-cni    - 安装 CNI 插件"
-	@echo "  install-daemon - 安装 headcni-daemon 服务 (可选)"
+	@echo "  install-daemon - 安装 headcni-daemon 服务"
 	@echo "  uninstall      - 卸载所有组件"
 	@echo ""
 	@echo "服务管理:"
@@ -115,10 +113,6 @@ $(DIST_DIR):
 build: $(BIN_DIR) $(BIN_FILES)
 	@echo "构建完成: $(BIN_FILES)"
 
-.PHONY: build-ipam
-build-ipam: $(BIN_DIR)
-	@echo "构建 headcni-ipam..."
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-ipam ./cmd/headcni-ipam/
 
 .PHONY: build-main
 build-main: $(BIN_DIR)
@@ -137,7 +131,6 @@ build-cli: $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-cli ./cmd/cli/
 
 # 二进制文件依赖
-$(BIN_DIR)/headcni-ipam: build-ipam
 $(BIN_DIR)/headcni: build-main
 $(BIN_DIR)/headcni-daemon: build-daemon
 $(BIN_DIR)/headcni-cli: build-cli
@@ -162,10 +155,8 @@ install-cni: build
 	sudo mkdir -p $(CNI_BIN_DIR)
 	sudo mkdir -p $(CNI_CONF_DIR)
 	sudo cp $(BIN_DIR)/headcni $(CNI_BIN_DIR)/
-	sudo cp $(BIN_DIR)/headcni-ipam $(CNI_BIN_DIR)/
 	sudo cp $(BIN_DIR)/headcni-daemon $(CNI_BIN_DIR)/
 	sudo chmod +x $(CNI_BIN_DIR)/headcni
-	sudo chmod +x $(CNI_BIN_DIR)/headcni-ipam
 	sudo chmod +x $(CNI_BIN_DIR)/headcni-daemon
 	@echo "CLI 工具已构建，可以运行: ./bin/headcni-cli --help"
 	@if [ -f $(EXAMPLES_DIR)/cni-config.json ]; then \
@@ -266,7 +257,7 @@ deploy-script:
 verify:
 	@echo "验证部署..."
 	@echo "检查 CNI 插件..."
-	@if [ -f "$(CNI_BIN_DIR)/headcni" ] && [ -f "$(CNI_BIN_DIR)/headcni-ipam" ]; then \
+	@if [ -f "$(CNI_BIN_DIR)/headcni" ]; then \
 		echo "✓ CNI 插件安装正确"; \
 	else \
 		echo "✗ CNI 插件安装失败"; \

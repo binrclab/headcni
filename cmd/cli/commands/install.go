@@ -41,7 +41,7 @@ Examples:
 
   # Custom configuration
   headcni install --headscale-url https://headscale.company.com --auth-key YOUR_KEY \
-    --pod-cidr 10.42.0.0/16 --ipam-type headcni-ipam
+    --pod-cidr 10.42.0.0/16 --ipam-type host-local
 
   # Dry run
   headcni install --headscale-url https://headscale.company.com --auth-key YOUR_KEY --dry-run`,
@@ -61,7 +61,7 @@ Examples:
 	cmd.Flags().StringVar(&opts.ReleaseName, "release-name", "headcni", "Helm release name")
 	cmd.Flags().StringVar(&opts.PodCIDR, "pod-cidr", "10.244.0.0/16", "Pod CIDR")
 	cmd.Flags().StringVar(&opts.ServiceCIDR, "service-cidr", "10.96.0.0/16", "Service CIDR")
-	cmd.Flags().StringVar(&opts.IPAMType, "ipam-type", "host-local", "IPAM type (host-local or headcni-ipam)")
+	cmd.Flags().StringVar(&opts.IPAMType, "ipam-type", "host-local", "IPAM type (host-local or host-local)")
 	cmd.Flags().StringVar(&opts.ImageRepo, "image-repo", "binrc/headcni", "Docker image repository")
 	cmd.Flags().StringVar(&opts.ImageTag, "image-tag", "latest", "Docker image tag")
 	cmd.Flags().BoolVar(&opts.DryRun, "dry-run", false, "Show what would be installed without actually installing")

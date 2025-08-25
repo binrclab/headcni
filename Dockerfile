@@ -67,7 +67,6 @@ RUN mkdir -p \
 
 # 从构建阶段复制二进制文件
 COPY --from=builder /app/bin/headcni /opt/cni/bin/
-COPY --from=builder /app/bin/headcni-ipam /opt/cni/bin/
 COPY --from=builder /app/bin/headcni-daemon /opt/cni/bin/
 COPY --from=builder /app/bin/headcni-cli /opt/cni/bin/
 

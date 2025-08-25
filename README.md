@@ -17,7 +17,6 @@ HeadCNI is a Kubernetes CNI plugin that integrates Headscale and Tailscale funct
 - **Security**: Leverages Tailscale's WireGuard encryption
 - **Simple Deployment**: No additional etcd cluster required
 - **Monitoring Friendly**: Built-in Prometheus metrics
-- **Multi-Strategy IPAM**: Supports sequential, random, and dense-pack allocation strategies
 - **Daemon + Plugin Architecture**: Continuous daemon for dynamic network management
 - **MagicDNS Support**: Native Tailscale DNS integration
 
@@ -45,7 +44,7 @@ helm upgrade --install headcni ./chart \
   --namespace kube-system \
   --set config.headscale.url=https://headscale.company.com \
   --set config.headscale.authKey=YOUR_AUTH_KEY \
-  --set config.ipam.type=headcni-ipam
+  --set config.ipam.type=host-local
 ```
 
 #### Method 2: Manual Deployment
@@ -69,7 +68,6 @@ make install
 
 # Or install manually
 sudo cp bin/headcni /opt/cni/bin/
-sudo cp bin/headcni-ipam /opt/cni/bin/
 sudo cp bin/headcni-daemon /opt/cni/bin/
 sudo cp 10-headcni.conflist /etc/cni/net.d/
 ```
@@ -152,7 +150,6 @@ HeadCNI supports MagicDNS configuration for simplified DNS management:
 HeadCNI supports two IPAM types:
 
 1. **host-local**: Standard CNI IPAM plugin, simple and efficient
-2. **headcni-ipam**: Custom IPAM plugin with advanced features
 
 ### 🔐 API Key Security
 
@@ -254,7 +251,6 @@ headcni/
 ├── cmd/                    # Command line tools
 │   ├── headcni/           # Main CNI plugin
 │   ├── headcni-daemon/    # Daemon component
-│   ├── headcni-ipam/      # IPAM plugin
 │   └── cli/               # CLI tool
 ├── pkg/                   # Core packages
 │   ├── daemon/           # Daemon logic
