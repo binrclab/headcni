@@ -1,0 +1,4 @@
+[submodule "tailscale"]
+	path = tailscale
+	url = https://github.com/binrclab/tailscale.git
+	branch = v1.86.4.fine-tuned-version
