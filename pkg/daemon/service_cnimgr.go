@@ -144,7 +144,7 @@ func (s *CNIService) IsRunning() bool {
 // createCNIServerWithRouteValidation 创建带有路由验证的 CNI 服务器
 func (s *CNIService) createCNIServerWithRouteValidation() *cni.Server {
 	return cni.NewServerWithCallbacks(
-		s.preparer.GetTailscaleClient().GetSocketPath(),
+		constants.DefaultSocketPath,
 		s.handleAllocateWithValidation, // allocate 回调
 		s.handleReleaseWithValidation,  // release 回调
 		s.handleStatusWithValidation,   // status 回调

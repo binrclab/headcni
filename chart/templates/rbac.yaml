@@ -14,15 +14,26 @@ metadata:
   labels:
     {{- include "headcni.labels" . | nindent 4 }}
 rules:
+# 基础权限 - 节点操作（必需）
 - apiGroups: [""]
   resources: ["nodes"]
   verbs: ["get", "list", "watch"]
+
+# 高级权限 - 根据配置需要（可选）
+{{- if .Values.config.advancedPermissions.enabled }}
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["pods/status"]
   verbs: ["patch"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

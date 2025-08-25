@@ -7,19 +7,20 @@ import (
 	"sync"
 	"time"
 
+	coreV1 "k8s.io/api/core/v1"
+
 	"github.com/binrclab/headcni/pkg/constants"
 	"github.com/binrclab/headcni/pkg/headscale"
 	"github.com/binrclab/headcni/pkg/k8s"
 	"github.com/binrclab/headcni/pkg/logging"
-	coreV1 "k8s.io/api/core/v1"
 )
 
 // PodMonitoringService Pod 状态监听服务
 type PodMonitoringService struct {
-	preparer   *Preparer
-	controller *k8s.Controller
-	running    bool
-	mu         sync.RWMutex
+	preparer  *Preparer
+	k8sClient k8s.Client
+	running   bool
+	mu        sync.RWMutex
 
 	// 网络配置状态
 	currentPodCIDR string
@@ -92,8 +93,20 @@ func (s *PodMonitoringService) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// 获取 Kubernetes 客户端
+	k8sClient := s.preparer.GetK8sClient()
+
+	// 获取当前节点名称
+	nodeName, err := k8sClient.GetCurrentNodeName()
+	if err != nil {
+		// 更新健康状态为失败
+		healthMgr := GetGlobalHealthManager()
+		healthMgr.UpdateServiceStatus(s.Name(), false, err)
+		return fmt.Errorf("failed to get current node name: %v", err)
+	}
+
 	// 获取当前节点信息
-	node, err := s.preparer.GetK8sClient().GetCurrentNode()
+	node, err := k8sClient.Nodes().Get(context.Background(), nodeName)
 	if err != nil {
 		// 更新健康状态为失败
 		healthMgr := GetGlobalHealthManager()
@@ -102,16 +115,20 @@ func (s *PodMonitoringService) Start(ctx context.Context) error {
 	}
 
 	// 记录当前 Pod CIDR
-	s.currentPodCIDR = k8s.GetNodePodCIDR(node)
+	s.currentPodCIDR, err = k8sClient.Nodes().GetPodCIDR(nodeName)
+	if err != nil {
+		// 更新健康状态为失败
+		healthMgr := GetGlobalHealthManager()
+		healthMgr.UpdateServiceStatus(s.Name(), false, err)
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %v", nodeName, err)
+	}
 	s.lastCheckTime = time.Now()
 
 	logging.Infof("Pod monitoring service starting for node: %s, Pod CIDR: %s",
 		node.Name, s.currentPodCIDR)
 
-	// 启动 Kubernetes 控制器
-	handler := &DaemonNodeHandler{preparer: s.preparer, service: s}
-	s.controller = k8s.NewController(handler, k8s.FilterNodeByName(node.Name))
-	s.controller.Start()
+	// 保存 k8s 客户端引用
+	s.k8sClient = k8sClient
 
 	// 启动网络配置监控协程
 	go s.networkConfigMonitor(ctx)
@@ -133,12 +150,8 @@ func (s *PodMonitoringService) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	// 停止控制器
-	if s.controller != nil {
-		s.controller.Stop()
-		s.controller = nil
-	}
-
+	// 清理资源
+	s.k8sClient = nil
 	s.running = false
 
 	// 更新健康状态
@@ -170,8 +183,8 @@ func (h *DaemonNodeHandler) OnNodeUpdate(oldNode, newNode *coreV1.Node) error {
 	logging.Infof("Node updated - name: %s", newNode.Name)
 
 	// 检查 Pod CIDR 是否发生变化
-	oldPodCIDR := k8s.GetNodePodCIDR(oldNode)
-	newPodCIDR := k8s.GetNodePodCIDR(newNode)
+	oldPodCIDR := oldNode.Spec.PodCIDR
+	newPodCIDR := newNode.Spec.PodCIDR
 
 	if oldPodCIDR != newPodCIDR {
 		logging.Infof("Pod CIDR changed from %s to %s", oldPodCIDR, newPodCIDR)
@@ -211,14 +224,20 @@ func (s *PodMonitoringService) checkNetworkConfiguration(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 获取当前节点信息
-	node, err := s.preparer.GetK8sClient().GetCurrentNode()
+	// 获取当前节点名称
+	k8sClient := s.preparer.GetK8sClient()
+	nodeName, err := k8sClient.GetCurrentNodeName()
 	if err != nil {
-		logging.Errorf("Failed to get current node: %v", err)
+		logging.Errorf("Failed to get current node name: %v", err)
 		return
 	}
 
-	currentPodCIDR := k8s.GetNodePodCIDR(node)
+	// 获取当前 Pod CIDR
+	currentPodCIDR, err := k8sClient.Nodes().GetPodCIDR(nodeName)
+	if err != nil {
+		logging.Errorf("Failed to get Pod CIDR for node %s: %v", nodeName, err)
+		return
+	}
 
 	// 检查 Pod CIDR 是否发生变化
 	if currentPodCIDR != s.currentPodCIDR {

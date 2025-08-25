@@ -3,9 +3,11 @@ package cni
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/binrclab/headcni/pkg/logging"
 )
@@ -74,8 +76,14 @@ func (s *Server) Start() error {
 
 // Stop 停止 CNI 服务器
 func (s *Server) Stop() error {
+	// 验证并清理 socket 路径
+	cleanPath := s.validateAndCleanSocketPath()
+	if cleanPath == "" {
+		return fmt.Errorf("socket path is empty or invalid")
+	}
+
 	// 删除 socket 文件
-	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove socket file: %v", err)
 	}
 	return nil
@@ -83,17 +91,51 @@ func (s *Server) Stop() error {
 
 // prepareSocketDirectory 准备 socket 目录
 func (s *Server) prepareSocketDirectory() error {
+	// 验证并清理 socket 路径
+	cleanPath := s.validateAndCleanSocketPath()
+	if cleanPath == "" {
+		return fmt.Errorf("socket path is empty or invalid")
+	}
+
 	// 创建 socket 目录
-	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(cleanPath), 0755); err != nil {
 		return fmt.Errorf("failed to create socket directory: %v", err)
 	}
 
 	// 删除已存在的 socket 文件
-	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(cleanPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to remove existing socket: %v", err)
 	}
 
 	return nil
+}
+
+// validateAndCleanSocketPath 验证并清理 socket 路径，确保使用正确的 Unix socket 格式
+func (s *Server) validateAndCleanSocketPath() string {
+	path := s.socketPath
+
+	// 如果路径为空，返回错误
+	if path == "" {
+		return ""
+	}
+
+	// 移除可能的错误协议前缀
+	path = strings.TrimPrefix(path, "tcp://")
+	path = strings.TrimPrefix(path, "http://")
+	path = strings.TrimPrefix(path, "https://")
+	path = strings.TrimPrefix(path, "unix://")
+
+	// 确保路径以 / 开头（绝对路径）
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	// 记录清理后的路径
+	if path != s.socketPath {
+		logging.Warnf("Socket path cleaned from '%s' to '%s'", s.socketPath, path)
+	}
+
+	return path
 }
 
 // createAndStartHTTPServer 创建并启动 HTTP 服务器
@@ -101,19 +143,30 @@ func (s *Server) createAndStartHTTPServer() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cni", s.handleCNIRequest)
 
+	// 验证并清理 socket 路径
+	cleanPath := s.validateAndCleanSocketPath()
+	if cleanPath == "" {
+		return fmt.Errorf("socket path is empty or invalid")
+	}
+
+	// 创建 Unix socket 监听器
+	listener, err := net.Listen("unix", cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to create Unix socket listener: %v", err)
+	}
+
 	s.server = &http.Server{
-		Addr:    "unix://" + s.socketPath,
 		Handler: mux,
 	}
 
 	// 启动服务器
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			logging.Errorf("CNI server error: %v", err)
 		}
 	}()
 
-	logging.Infof("CNI server started: %s", s.socketPath)
+	logging.Infof("CNI server started on Unix socket: %s", cleanPath)
 	return nil
 }
 

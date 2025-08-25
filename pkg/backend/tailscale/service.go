@@ -3,6 +3,7 @@ package tailscale
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/binrclab/headcni/pkg/logging"
+	"github.com/vishvananda/netlink"
 	"tailscale.com/tsnet"
 )
 
@@ -222,22 +224,34 @@ func (s *Service) checkSystemTailscaled(ctx context.Context) error {
 		s.Options.Logf("检查系统级别tailscaled服务是否已启动")
 	}
 
-	// 检查系统tailscaled服务是否已启动
-	cmd := exec.Command("systemctl", "status", "tailscaled")
-	err := cmd.Run()
+	// 在 Pod 环境中，systemctl 不可用，改用 socket 检查
+	// 检查系统tailscaled socket 是否存在且可访问
+	socketPath := "/var/run/tailscale/tailscaled.sock"
+
+	// 检查 socket 文件是否存在
+	if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+		if s.Options.Logf != nil {
+			s.Options.Logf("系统tailscaled socket不存在: %s", socketPath)
+		}
+		return fmt.Errorf("系统tailscaled socket不存在: %s", socketPath)
+	}
+
+	// 尝试连接 socket 来验证服务是否运行
+	conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
 	if err != nil {
 		if s.Options.Logf != nil {
-			s.Options.Logf("系统级别tailscaled服务未启动: %v", err)
+			s.Options.Logf("系统tailscaled服务未响应: %v", err)
 		}
-		return fmt.Errorf("系统tailscaled服务未启动")
+		return fmt.Errorf("系统tailscaled服务未响应: %v", err)
 	}
+	conn.Close()
 
 	if s.Options.Logf != nil {
 		s.Options.Logf("系统级别tailscaled服务已启动")
 	}
 
 	// 设置socket路径为系统默认路径
-	s.SocketPath = "/var/run/tailscale/tailscaled.sock"
+	s.SocketPath = socketPath
 
 	return nil
 }
@@ -421,7 +435,7 @@ func (s *Service) startTailscaledProcess() error {
 	}
 
 	// 等待socket文件创建
-	maxWait := 30 * time.Second
+	maxWait := 120 * time.Second // 从30s增加到120s，给tailscaled更多启动时间
 	checkInterval := 500 * time.Millisecond
 	elapsed := time.Duration(0)
 
@@ -475,21 +489,55 @@ func (s *Service) checkExistingProcess(pidFile string) bool {
 		return false
 	}
 
-	// 检查进程是否存在
-	cmd := exec.Command("kill", "-0", fmt.Sprintf("%d", pid))
-	if err := cmd.Run(); err != nil {
-		return false
-	}
-
-	// 检查进程是否是tailscaled
-	cmd = exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "comm=")
-	output, err := cmd.Output()
+	// 在 Pod 环境中，使用更安全的方式检查进程
+	// 检查进程是否存在 - 使用 os.FindProcess 替代 kill -0
+	process, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
 
-	processName := strings.TrimSpace(string(output))
+	// 尝试发送信号 0 来检查进程是否存在（在 Linux 上，os.Signal(nil) 不被支持）
+	// 使用其他方法检查进程状态
+	if err := process.Signal(syscall.Signal(0)); err != nil {
+		return false
+	}
+
+	// 在 Pod 环境中，ps 命令可能不可用，改用 /proc 文件系统
+	// 检查进程是否是tailscaled
+	commPath := fmt.Sprintf("/proc/%d/comm", pid)
+	commData, err := os.ReadFile(commPath)
+	if err != nil {
+		return false
+	}
+
+	processName := strings.TrimSpace(string(commData))
 	if processName != "tailscaled" {
+		return false
+	}
+
+	// 关键修复：检查进程是否是我们自己启动的
+	// 通过检查进程的工作目录来确认
+	cwdPath := fmt.Sprintf("/proc/%d/cwd", pid)
+	cwdData, err := os.ReadFile(cwdPath)
+	if err != nil {
+		return false
+	}
+
+	// 在 Pod 环境中，/proc/pid/cwd 可能是指向实际目录的符号链接
+	// 使用 os.Readlink 获取真实路径
+	processCwd, err := os.Readlink(cwdPath)
+	if err != nil {
+		// 如果无法读取链接，使用原始数据
+		processCwd = strings.TrimSpace(string(cwdData))
+	}
+
+	// 如果进程的工作目录是系统目录，说明是系统的 tailscaled，我们不能管理
+	if strings.Contains(processCwd, "/var/lib/tailscale") ||
+		strings.Contains(processCwd, "/usr") ||
+		strings.Contains(processCwd, "/opt") {
+		if s.Options.Logf != nil {
+			s.Options.Logf("检测到系统 tailscaled 进程 (PID: %d, CWD: %s)，跳过管理", pid, processCwd)
+		}
 		return false
 	}
 
@@ -500,18 +548,36 @@ func (s *Service) checkExistingProcess(pidFile string) bool {
 
 	// 检查网络接口是否存在
 	interfaceName := fmt.Sprintf("%s", s.Name)
-	cmd = exec.Command("ip", "link", "show", interfaceName)
-	if err := cmd.Run(); err != nil {
+
+	// 在 Pod 环境中，ip 命令可能不可用，改用 netlink
+	// 使用 netlink 检查接口是否存在
+	links, err := netlink.LinkList()
+	if err != nil {
+		if s.Options.Logf != nil {
+			s.Options.Logf("Failed to list network links: %v", err)
+		}
+		return false
+	}
+
+	interfaceExists := false
+	for _, link := range links {
+		if link.Attrs().Name == interfaceName {
+			interfaceExists = true
+			break
+		}
+	}
+
+	if !interfaceExists {
 		if s.Options.Logf != nil {
 			s.Options.Logf("网络接口 %s 不存在", interfaceName)
 		}
 		return false
 	}
 
-	// 设置PID和socket路径
+	// 设置PID和socket路径 - 只有确认是我们自己启动的进程才设置
 	s.SystemTailscaledPID = pid
 	if s.Options.Logf != nil {
-		s.Options.Logf("网络接口 %s 存在", interfaceName)
+		s.Options.Logf("确认管理自己启动的 tailscaled 进程 (PID: %d, CWD: %s)", pid, processCwd)
 	}
 
 	return true
@@ -522,21 +588,61 @@ func (s *Service) checkExistingTailscaled() bool {
 	// 检查系统默认的tailscaled socket
 	defaultSocket := "/var/run/tailscale/tailscaled.sock"
 	if _, err := os.Stat(defaultSocket); err == nil {
+		// 在 Pod 环境中，lsof 可能不可用，改用 socket 连接测试
 		// 检查是否有进程在使用这个socket
-		cmd := exec.Command("lsof", defaultSocket)
-		if err := cmd.Run(); err == nil {
-			// 有进程在使用，直接使用这个socket
-			s.SocketPath = defaultSocket
-			return true
+		conn, err := net.DialTimeout("unix", defaultSocket, 1*time.Second)
+		if err == nil {
+			conn.Close()
+			// 有进程在使用，但这是系统的 tailscaled，我们不能使用
+			// 在 daemon 模式下，应该启动自己的 tailscaled
+			if s.Options.Logf != nil {
+				s.Options.Logf("检测到系统 tailscaled 服务正在运行，daemon 模式将启动独立的 tailscaled")
+			}
+			return false
 		}
 	}
 
+	// 在 Pod 环境中，pgrep 可能不可用，改用 /proc 文件系统
 	// 检查是否有其他tailscaled进程
-	cmd := exec.Command("pgrep", "tailscaled")
-	if err := cmd.Run(); err == nil {
-		// 找到tailscaled进程，尝试使用默认socket
-		s.SocketPath = "/var/run/tailscale/tailscaled.sock"
-		return true
+	hasTailscaledProcess := false
+
+	// 遍历 /proc 目录查找 tailscaled 进程
+	procDir, err := os.Open("/proc")
+	if err == nil {
+		defer procDir.Close()
+
+		entries, err := procDir.ReadDir(0)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+
+				// 检查是否是数字目录（PID）
+				if _, err := strconv.Atoi(entry.Name()); err != nil {
+					continue
+				}
+
+				// 检查进程名称
+				commPath := fmt.Sprintf("/proc/%s/comm", entry.Name())
+				if commData, err := os.ReadFile(commPath); err == nil {
+					processName := strings.TrimSpace(string(commData))
+					if processName == "tailscaled" {
+						hasTailscaledProcess = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if hasTailscaledProcess {
+		// 找到tailscaled进程，但我们需要确认这是否是我们自己启动的
+		// 通过检查进程的工作目录和命令行参数来区分
+		if s.Options.Logf != nil {
+			s.Options.Logf("检测到 tailscaled 进程，但 daemon 模式将启动独立的 tailscaled")
+		}
+		return false
 	}
 
 	return false
@@ -544,13 +650,64 @@ func (s *Service) checkExistingTailscaled() bool {
 
 // stopTailscaledProcess 停止tailscaled进程
 func (s *Service) stopTailscaledProcess() error {
+	// 方法1：使用记录的进程命令
 	if s.SystemTailscaledCmd != nil && s.SystemTailscaledCmd.Process != nil {
-		return s.SystemTailscaledCmd.Process.Kill()
+		pid := s.SystemTailscaledCmd.Process.Pid
+		logging.Infof("Stopping tailscaled process (PID: %d)", pid)
+
+		if err := s.SystemTailscaledCmd.Process.Kill(); err != nil {
+			logging.Warnf("Failed to kill process %d: %v", pid, err)
+		} else {
+			logging.Infof("Successfully stopped tailscaled process (PID: %d)", pid)
+			return nil
+		}
 	}
 
-	// 查找并停止tailscaled进程
-	cmd := exec.Command("pkill", "-f", fmt.Sprintf("tailscaled.*headcni%s", s.Name))
-	return cmd.Run()
+	// 方法2：使用记录的 PID - 增加安全检查
+	if s.SystemTailscaledPID > 0 {
+		logging.Infof("Stopping tailscaled process by PID: %d", s.SystemTailscaledPID)
+
+		// 额外安全检查：确认这个进程确实是我们应该管理的
+		if process, err := os.FindProcess(s.SystemTailscaledPID); err == nil {
+			// 在 Pod 环境中，ps 命令可能不可用，改用 /proc 文件系统
+			// 再次检查进程名称和工作目录，确保不会误杀系统进程
+			cwdPath := fmt.Sprintf("/proc/%d/cwd", s.SystemTailscaledPID)
+
+			var processCwd string
+
+			// 读取进程工作目录
+			if cwdData, err := os.ReadFile(cwdPath); err == nil {
+				// 尝试读取符号链接获取真实路径
+				if realPath, err := os.Readlink(cwdPath); err == nil {
+					processCwd = realPath
+				} else {
+					processCwd = strings.TrimSpace(string(cwdData))
+				}
+			}
+
+			// 如果检测到系统进程特征，立即停止，不执行 kill
+			if strings.Contains(processCwd, "/var/lib/tailscale") ||
+				strings.Contains(processCwd, "/usr") ||
+				strings.Contains(processCwd, "/opt") {
+				logging.Warnf("检测到系统 tailscaled 进程 (PID: %d, CWD: %s)，跳过停止操作", s.SystemTailscaledPID, processCwd)
+				return fmt.Errorf("refusing to stop system tailscaled process")
+			}
+
+			logging.Infof("确认停止自己启动的 tailscaled 进程 (PID: %d, CWD: %s)", s.SystemTailscaledPID, processCwd)
+
+			// 执行进程停止
+			if err := process.Kill(); err != nil {
+				logging.Warnf("Failed to kill process %d: %v", s.SystemTailscaledPID, err)
+			} else {
+				logging.Infof("Successfully stopped tailscaled process (PID: %d)", s.SystemTailscaledPID)
+			}
+		}
+	}
+
+	// 方法3：如果都没有，记录警告但不执行 pkill
+	// 这样可以避免误杀系统的 tailscaled 服务
+	logging.Warnf("No valid process reference found, cannot stop tailscaled process safely")
+	return nil
 }
 
 // Stop 停止服务
@@ -717,17 +874,34 @@ func (sm *ServiceManager) GetServiceStatus(name string) (string, error) {
 	// 检查服务是否真的在运行
 	switch service.Options.Mode {
 	case ModeSystemTailscaled:
-		// 检查系统tailscaled服务状态
-		cmd := exec.Command("systemctl", "status", "tailscaled")
-		if err := cmd.Run(); err != nil {
-			service.LastError = err
+		// 在 Pod 环境中，systemctl 不可用，改用 socket 检查
+		socketPath := "/var/run/tailscale/tailscaled.sock"
+
+		// 检查 socket 文件是否存在
+		if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+			service.LastError = fmt.Errorf("系统tailscaled socket不存在")
 			return "disconnected", nil
 		}
+
+		// 尝试连接 socket 来验证服务是否运行
+		conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err != nil {
+			service.LastError = fmt.Errorf("系统tailscaled服务未响应: %v", err)
+			return "disconnected", nil
+		}
+		conn.Close()
+
 	case ModeStandaloneTailscaled:
 		// 检查独立tailscaled进程是否存在
 		if service.SystemTailscaledPID > 0 {
-			cmd := exec.Command("kill", "-0", fmt.Sprintf("%d", service.SystemTailscaledPID))
-			if err := cmd.Run(); err != nil {
+			// 在 Pod 环境中，使用 os.FindProcess 替代 kill -0
+			if process, err := os.FindProcess(service.SystemTailscaledPID); err == nil {
+				// 尝试发送信号 0 来检查进程是否存在
+				if err := process.Signal(syscall.Signal(0)); err != nil {
+					service.LastError = err
+					return "disconnected", nil
+				}
+			} else {
 				service.LastError = err
 				return "disconnected", nil
 			}

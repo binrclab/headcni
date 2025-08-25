@@ -8,6 +8,7 @@ package daemon
 
 import (
 	"context"
+
 	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
 	"github.com/google/wire"
 )
@@ -48,15 +49,11 @@ func ProvideDaemonFromPreparer(cfg *config.Config, preparer *Preparer) (*Daemon,
 
 	serviceManager := NewServiceManager()
 
-	cniService := NewCNIService(preparer)
-	podMonitoringService := NewPodMonitoringService(preparer)
-	headscaleHealthService := NewHeadscaleHealthService(preparer)
-	tailscaleService := NewTailscaleService(preparer)
-
-	serviceManager.RegisterService(cniService)
-	serviceManager.RegisterService(podMonitoringService)
-	serviceManager.RegisterService(headscaleHealthService)
-	serviceManager.RegisterService(tailscaleService)
+	serviceManager.RegisterService(NewCNIService(preparer))
+	serviceManager.RegisterService(NewPodMonitoringService(preparer))
+	serviceManager.RegisterService(NewHeadscaleHealthService(preparer))
+	serviceManager.RegisterService(NewTailscaleService(preparer))
+	serviceManager.RegisterService(NewMonitoringService(preparer))
 
 	daemon := NewDaemon(cfg, preparer, serviceManager)
 

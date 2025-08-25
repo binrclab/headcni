@@ -63,8 +63,6 @@ const (
 	DefaultTimeout             = 30 * time.Second
 	DefaultRetryAttempts       = 3
 	DefaultHealthCheckInterval = 30 * time.Second
-	DefaultBaseDir             = "/tmp/tailscale"
-	DefaultSocketPath          = "/var/run/headcni/tailscale/tailscaled.sock"
 
 	// 服务状态
 	ServiceStatusRunning      = "running"
@@ -88,17 +86,3 @@ var (
 	ErrConnectivityFailed  = fmt.Errorf("connectivity check failed")
 	ErrConfigRequired      = fmt.Errorf("config cannot be nil")
 )
-
-func GetServiceMode(mode string) ServiceMode {
-	if mode == "host" {
-		return ModeSystemTailscaled
-	}
-	return ModeStandaloneTailscaled
-}
-
-func GetTailscaleNic(mode ServiceMode) string {
-	if mode == ModeSystemTailscaled {
-		return "tailscale0"
-	}
-	return "headnic01"
-}

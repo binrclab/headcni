@@ -15,14 +15,15 @@ spec:
         {{- include "headcni.selectorLabels" . | nindent 8 }}
     spec:
       # Use host network mode, CNI plugin needs direct access to host network
-      hostNetwork: true
+      hostNetwork: true  # 使用主机网络避免 DNS 问题
+      dnsPolicy: Default 
       # Use host PID namespace for process management
       hostPID: true
       serviceAccountName: {{ include "headcni.serviceAccountName" . }}
       # Set restart policy
       restartPolicy: Always
-      # Termination grace period
-      terminationGracePeriodSeconds: 30
+      # Termination grace period - increased for Tailscale graceful shutdown
+      terminationGracePeriodSeconds: 120
       initContainers:
       - name: setup-headcni
         image: "{{ .Values.image.repository }}"
@@ -38,73 +39,183 @@ spec:
           chmod +x /host/opt/cni/bin/headcni-ipam
           
           # 2. Prepare configuration in container
-          mkdir -p /tmp/headcni/config
-          mkdir -p /tmp/headcni/templates
+          mkdir -p /opt/headcni/config
+          mkdir -p /opt/headcni/templates
           
           # Copy template files
-          cp /etc/headcni/headcni-daemon.env /tmp/headcni/config/
+          cp /etc/headcni/headcni-daemon.env /opt/headcni/config/
           
           # Create configuration file
-          cat > /tmp/headcni/config/daemon.yaml <<EOF
+          cat > /opt/headcni/config/daemon.yaml <<EOF
+          # HeadCNI Daemon Configuration
+          # Generated from Helm chart values
+          
           daemon:
-            logLevel: info
-            hostNetwork: true
-            metrics:
-              enabled: {{ .Values.config.monitoring.enabled }}
-              port: {{ .Values.config.monitoring.port }}
-              path: {{ .Values.config.monitoring.path }}
-          
-          network:
-            podCIDR:
-              base: {{ .Values.config.network.podCIDR }}
-              perNode: "/24"
-            serviceCIDR: {{ .Values.config.network.serviceCIDR }}
-            mtu: {{ .Values.config.network.mtu }}
-            enableIPv6: {{ .Values.config.network.enableIPv6 }}
-            enableNetworkPolicy: {{ .Values.config.network.enableNetworkPolicy }}
-          
-          ipam:
-            type: {{ .Values.config.ipam.type }}
-            strategy: {{ .Values.config.ipam.strategy }}
-            gcInterval: {{ .Values.config.ipam.gcInterval }}
+            logLevel: {{ .Values.config.daemon.logLevel | default "info" }}
+            hostNetwork: {{ .Values.config.daemon.hostNetwork | default true }}
           
           headscale:
             url: {{ .Values.config.headscale.url }}
-            authKey: ""
+            authKey: {{ .Values.config.headscale.authKey | default "" }}
+            timeout: {{ .Values.config.headscale.timeout | default "30s" }}
+            retries: {{ .Values.config.headscale.retries | default 3 }}
           
           tailscale:
-            mode: {{ .Values.config.tailscale.mode }}
+            mode: {{ .Values.config.tailscale.mode | default "daemon" }}
             url: {{ .Values.config.tailscale.url }}
             socket:
               path: {{ .Values.config.tailscale.socket.path }}
               name: {{ .Values.config.tailscale.socket.name }}
+            mtu: {{ .Values.config.tailscale.mtu | default 1280 }}
+            acceptDNS: {{ .Values.config.tailscale.acceptDNS | default false }}
             hostname:
-              prefix: {{ .Values.config.tailscale.hostname.prefix }}
-              type: {{ .Values.config.tailscale.hostname.type }}
-            mtu: {{ .Values.config.tailscale.mtu }}
-            acceptDNS: {{ .Values.config.tailscale.acceptDNS }}
-            user: {{ .Values.config.tailscale.user }}
+              prefix: {{ .Values.config.tailscale.hostname.prefix | default "headcni-pod" }}
+              type: {{ .Values.config.tailscale.hostname.type | default "hostname" }}
+            user: {{ .Values.config.tailscale.user | default "server" }}
+            interfaceName: {{ .Values.config.tailscale.interfaceName | default "headcni01" }}
             tags:
+          {{- if .Values.config.tailscale.tags }}
           {{- range .Values.config.tailscale.tags }}
             - {{ . }}
           {{- end }}
+          {{- else }}
+            - "tag:control-server"
+            - "tag:headcni"
+          {{- end }}
+          
+          network:
+            podCIDR:
+              base: {{ .Values.config.network.podCIDR | default "" }}
+              perNode: {{ .Values.config.network.podCIDRSubnet | default "/24" }}
+            serviceCIDR: {{ .Values.config.network.serviceCIDR | default "" }}
+            mtu: {{ .Values.config.network.mtu | default 1280 }}
+            enableIPv6: {{ .Values.config.network.enableIPv6 | default false }}
+            enableNetworkPolicy: {{ .Values.config.network.enableNetworkPolicy | default true }}
+          
+          ipam:
+            type: {{ .Values.config.ipam.type | default "host-local" }}
+            strategy: {{ .Values.config.ipam.strategy | default "sequential" }}
+            gcInterval: {{ .Values.config.ipam.gcInterval | default "1h" }}
+            subnets: []
           
           dns:
             magicDNS:
-              enabled: {{ .Values.config.dns.magicDNS.enabled }}
+              enabled: {{ .Values.config.dns.magicDNS.enabled | default true }}
               nameservers:
+          {{- if .Values.config.dns.magicDNS.nameservers }}
           {{- range .Values.config.dns.magicDNS.nameservers }}
               - {{ . }}
           {{- end }}
+          {{- else }}
+              - "8.8.8.8"
+              - "8.8.4.4"
+          {{- end }}
               searchDomains:
+          {{- if .Values.config.dns.magicDNS.searchDomains }}
           {{- range .Values.config.dns.magicDNS.searchDomains }}
               - {{ . }}
           {{- end }}
+          {{- else }}
+              - "cluster.local"
+          {{- end }}
               options:
+          {{- if .Values.config.dns.magicDNS.options }}
           {{- range .Values.config.dns.magicDNS.options }}
               - {{ . }}
           {{- end }}
+          {{- else }}
+              - "ndots:5"
+              - "timeout:2"
+          {{- end }}
+            custom:
+              enabled: false
+              nameservers: []
+              searchDomains: []
+              options: []
+          
+          monitoring:
+            enabled: {{ .Values.config.monitoring.enabled | default true }}
+            port: {{ .Values.config.monitoring.port | default 9001 }}
+            path: {{ .Values.config.monitoring.path | default "/metrics" }}
+          
+          logging:
+            level: {{ .Values.config.logging.level | default "info" }}
+            format: {{ .Values.config.logging.format | default "json" }}
+            output: {{ .Values.config.logging.output | default "stdout" }}
+            file:
+              enabled: {{ .Values.config.logging.file.enabled | default false }}
+              path: {{ .Values.config.logging.file.path | default "/var/log/headcni/headcni.log" }}
+              maxSize: {{ .Values.config.logging.file.maxSize | default "100MB" }}
+              maxBackups: {{ .Values.config.logging.file.maxBackups | default 3 }}
+              maxAge: {{ .Values.config.logging.file.maxAge | default "7d" }}
+          
+          security:
+            tls:
+              enabled: {{ .Values.config.security.tls.enabled | default false }}
+              certFile: {{ .Values.config.security.tls.certFile | default "" }}
+              keyFile: {{ .Values.config.security.tls.keyFile | default "" }}
+              caFile: {{ .Values.config.security.tls.caFile | default "" }}
+            auth:
+              enabled: {{ .Values.config.security.auth.enabled | default false }}
+              type: {{ .Values.config.security.auth.type | default "token" }}
+              token: {{ .Values.config.security.auth.token | default "" }}
+            networkPolicy:
+              enabled: {{ .Values.config.security.networkPolicy.enabled | default true }}
+              ingress: []
+              egress: []
+          
+          performance:
+            connectionPool:
+              maxConnections: {{ .Values.config.performance.connectionPool.maxConnections | default 100 }}
+              maxIdleConnections: {{ .Values.config.performance.connectionPool.maxIdleConnections | default 10 }}
+              connectionTimeout: {{ .Values.config.performance.connectionPool.connectionTimeout | default "30s" }}
+              idleTimeout: {{ .Values.config.performance.connectionPool.idleTimeout | default "90s" }}
+            cache:
+              enabled: {{ .Values.config.performance.cache.enabled | default true }}
+              size: {{ .Values.config.performance.cache.size | default "100MB" }}
+              ttl: {{ .Values.config.performance.cache.ttl | default "1h" }}
+            concurrency:
+              maxWorkers: {{ .Values.config.performance.concurrency.maxWorkers | default 10 }}
+              queueSize: {{ .Values.config.performance.concurrency.queueSize | default 100 }}
           EOF
+
+          # 检查是否需要保护 DNS
+          if [ "{{ .Values.config.tailscale.acceptDNS | quote }}" = "false" ]; then
+            echo "Tailscale DNS disabled, protecting resolv.conf"
+            
+            # 检查 resolv.conf 是否存在
+            if [ -f /etc/resolv.conf ]; then
+              echo "Found resolv.conf, attempting to protect it"
+              
+              # 备份原始文件
+              cp /etc/resolv.conf /etc/resolv.conf.backup
+              
+              # 使用多种方式保护文件
+              if command -v chattr >/dev/null 2>&1; then
+                # 使用 chattr 设置不可变标志
+                chattr +i /etc/resolv.conf && echo "chattr: Set immutable flag on resolv.conf"
+              fi
+              
+              # 设置只读权限
+              chmod 444 /etc/resolv.conf && echo "chmod: Set read-only permissions on resolv.conf"
+              
+              # 验证保护状态
+              if [ -r /etc/resolv.conf ] && [ ! -w /etc/resolv.conf ]; then
+                echo "✓ resolv.conf is now protected (read-only)"
+              else
+                echo "⚠ Warning: resolv.conf protection may not be fully effective"
+              fi
+              
+              # 显示当前状态
+              echo "Current resolv.conf permissions:"
+              ls -la /etc/resolv.conf
+            else
+              echo "resolv.conf not found in container, skipping protection"
+            fi
+            
+          else
+            echo "Tailscale DNS enabled, skipping protection"
+          fi
           
           echo "HeadCNI setup completed"
         volumeMounts:
@@ -112,8 +223,8 @@ spec:
           mountPath: /host/opt/cni/bin
         - name: headcni-config
           mountPath: /etc/headcni
-        - name: shared-config
-          mountPath: /tmp/headcni
+        - name: runtime-config
+          mountPath: /opt/headcni/config
         securityContext:
           runAsNonRoot: false
           runAsUser: 0
@@ -124,9 +235,13 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         command:
         - /opt/cni/bin/headcni-daemon
-        - --config=/tmp/headcni/config/daemon.yaml
+        - --config=/opt/headcni/config/daemon.yaml
         - --log-level=info
         env:
+        - name: TS_ACCEPT_DNS
+          value: "{{ .Values.config.tailscale.acceptDNS }}"
+        - name: TS_OVERRIDE_LOCAL_DNS  
+          value: "{{ .Values.config.tailscale.overrideLocalDNS }}"
         - name: NODE_NAME
           valueFrom:
             fieldRef:
@@ -172,10 +287,10 @@ spec:
         # HeadCNI configuration - read-only
         - name: headcni-config
           mountPath: /etc/headcni
-          readOnly: true
-        # Temporary configuration directory
-        - name: shared-config
-          mountPath: /tmp/headcni
+          readOnly: false
+        # Runtime configuration directory (container internal only)
+        - name: runtime-config
+          mountPath: /opt/headcni/config
         # Tailscale runtime directory
         - name: tailscale-runtime
           mountPath: /var/run/tailscale
@@ -185,9 +300,11 @@ spec:
         # HeadCNI runtime data
         - name: headcni-runtime
           mountPath: /var/run/headcni
+          readOnly: false
         # HeadCNI persistent data
         - name: headcni-data
           mountPath: /var/lib/headcni
+          readOnly: false
         {{- if .Values.config.monitoring.enabled }}
         ports:
         - name: metrics
@@ -201,19 +318,27 @@ spec:
           httpGet:
             path: /health
             port: {{ .Values.config.monitoring.port }}
-          initialDelaySeconds: 30
-          periodSeconds: 10
-          timeoutSeconds: 5
+          initialDelaySeconds: 300
+          periodSeconds: 60
+          timeoutSeconds: 15
           failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /health
             port: {{ .Values.config.monitoring.port }}
-          initialDelaySeconds: 15
-          periodSeconds: 5
-          timeoutSeconds: 3
+          initialDelaySeconds: 300
+          periodSeconds: 60
+          timeoutSeconds: 15
           successThreshold: 1
           failureThreshold: 3
+        startupProbe:
+          httpGet:
+            path: /health
+            port: {{ .Values.config.monitoring.port }}
+          initialDelaySeconds: 300
+          periodSeconds: 30
+          timeoutSeconds: 15
+          failureThreshold: 10
         {{- end }}
       volumes:
       # CNI configuration directory
@@ -225,8 +350,8 @@ spec:
       - name: headcni-config
         configMap:
           name: {{ include "headcni.fullname" . }}-config
-      # Temporary configuration directory
-      - name: shared-config
+      # Runtime configuration directory (container internal)
+      - name: runtime-config
         emptyDir: {}
       # Host CNI binary directory
       - name: host-cni-bin

@@ -128,7 +128,7 @@ build-main: $(BIN_DIR)
 # 可选组件构建目标
 .PHONY: build-daemon
 build-daemon: $(BIN_DIR)
-	@echo "构建 headcni-daemon (可选)..."
+	@echo "构建 headcni-daemon..."
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-daemon ./cmd/headcni-daemon/
 
 .PHONY: build-cli

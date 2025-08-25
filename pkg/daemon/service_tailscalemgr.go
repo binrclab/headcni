@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -18,9 +17,9 @@ import (
 	"github.com/binrclab/headcni/pkg/backend/tailscale"
 	"github.com/binrclab/headcni/pkg/constants"
 	"github.com/binrclab/headcni/pkg/headscale"
-	"github.com/binrclab/headcni/pkg/k8s"
 	"github.com/binrclab/headcni/pkg/logging"
 	"github.com/binrclab/headcni/pkg/utils"
+	"github.com/vishvananda/netlink"
 	coreV1 "k8s.io/api/core/v1"
 )
 
@@ -133,13 +132,42 @@ func (tsm *TailscaleService) setTailscaleEnv(tailscaleEnv *TailscaleEnv) {
 	tsm.tailscaleEnv = tailscaleEnv
 }
 
+// cleanupExpiredAuthKey 清理过期的认证密钥
+func (tsm *TailscaleService) cleanupExpiredAuthKey() {
+	if tsm.authKey != "" && !tsm.authKeyExpiredTime.IsZero() && tsm.authKeyExpiredTime.Before(time.Now()) {
+		logging.Infof("清理过期的认证密钥 (过期时间: %v)", tsm.authKeyExpiredTime)
+		tsm.authKey = ""
+		tsm.authKeyExpiredTime = time.Time{}
+	}
+}
+
+// validateAuthKey 验证认证密钥是否有效
+func (tsm *TailscaleService) validateAuthKey() bool {
+	if tsm.authKey == "" {
+		return false
+	}
+
+	if tsm.authKeyExpiredTime.IsZero() {
+		return false
+	}
+
+	return tsm.authKeyExpiredTime.After(time.Now())
+}
+
 // initTailscaleEnv 初始化 Tailscale 环境配置
 func (tsm *TailscaleService) initTailscaleEnv(node *coreV1.Node) *TailscaleEnv {
 	isHost := tsm.preparer.GetConfig().Tailscale.Mode == "host"
 	if isHost {
+		// 验证 host 模式的路径
+		configDir := filepath.Dir(constants.DefaultTailscaleHostSocketPath)
+		if configDir == "" || configDir == "." {
+			logging.Warnf("Invalid config directory path derived from socket path: %s", constants.DefaultTailscaleHostSocketPath)
+			configDir = "/var/run/headcni" // 使用默认路径作为后备
+		}
+
 		tailscaleEnv := &TailscaleEnv{
 			isDaemon:     isHost,
-			configDir:    filepath.Dir(constants.DefaultTailscaleHostSocketPath),
+			configDir:    configDir,
 			socketPath:   constants.DefaultTailscaleHostSocketPath,
 			statePath:    "",
 			pidPath:      "",
@@ -147,10 +175,25 @@ func (tsm *TailscaleService) initTailscaleEnv(node *coreV1.Node) *TailscaleEnv {
 			hostName:     node.Name,
 			tailscaleNic: "tailscale0",
 		}
+		logging.Infof("Initialized host mode environment - ConfigDir: %s, SocketPath: %s", configDir, constants.DefaultTailscaleHostSocketPath)
 		return tailscaleEnv
 	} else {
+		// 验证 daemon 模式的路径
 		configDir := filepath.Dir(tsm.preparer.GetConfig().Tailscale.Socket.Path)
+		if configDir == "" || configDir == "." {
+			logging.Warnf("Invalid config directory path derived from socket path: %s", tsm.preparer.GetConfig().Tailscale.Socket.Path)
+			configDir = "/var/run/headcni" // 使用默认路径作为后备
+		}
+
 		hostnamePath := filepath.Join(configDir, "hostname")
+
+		// 在 daemon 模式下，确保使用独特的接口名称
+		interfaceName := tsm.preparer.GetConfig().Tailscale.InterfaceName
+		if interfaceName == "" {
+			// 使用默认的 headcni01 接口名称
+			interfaceName = "headcni01"
+		}
+
 		tailscaleEnv := &TailscaleEnv{
 			isDaemon:     !isHost,
 			configDir:    configDir,
@@ -159,12 +202,11 @@ func (tsm *TailscaleService) initTailscaleEnv(node *coreV1.Node) *TailscaleEnv {
 			pidPath:      filepath.Join(configDir, "tailscaled.pid"),
 			hostNamePath: hostnamePath,
 			hostName:     tsm.readHostNameInDomain(hostnamePath),
-			tailscaleNic: tsm.preparer.GetConfig().Tailscale.InterfaceName,
+			tailscaleNic: interfaceName,
 		}
+		logging.Infof("Initialized daemon mode environment - ConfigDir: %s, SocketPath: %s, Interface: %s", configDir, tsm.preparer.GetConfig().Tailscale.Socket.Path, interfaceName)
 		return tailscaleEnv
-
 	}
-
 }
 
 // readHostNameInDomain 从文件读取主机名，如果文件不存在则生成新的
@@ -209,14 +251,23 @@ func (tsm *TailscaleService) Start(ctx context.Context) error {
 	}
 
 	// 获取当前节点信息
-	node, err := tsm.preparer.GetK8sClient().GetCurrentNode()
+	nodeName, err := tsm.preparer.GetK8sClient().GetCurrentNodeName()
 	if err != nil {
 		tsm.updateHealthStatus(false, err)
-		return tsm.handleErrorWithLog(err, "Failed to get current node: %v", err)
+		return tsm.handleErrorWithLog(err, "Failed to get current node name: %w", err)
+	}
+
+	node, err := tsm.preparer.GetK8sClient().Nodes().Get(context.Background(), nodeName)
+	if err != nil {
+		tsm.updateHealthStatus(false, err)
+		return tsm.handleErrorWithLog(err, "Failed to get current node: %w", err)
 	}
 
 	tsm.tailscaleEnv = tsm.initTailscaleEnv(node)
 	tsm.hostname = node.Name
+
+	// Headscale.AuthKey 是用于调用 Headscale API 的密钥，不是 Tailscale 登录密钥
+	// 这里不需要设置 tsm.authKey，它会在需要时从 Headscale 获取
 
 	// 根据配置模式选择启动方式
 	mode := tsm.preparer.GetConfig().Tailscale.Mode
@@ -238,6 +289,9 @@ func (tsm *TailscaleService) Start(ctx context.Context) error {
 	tsm.isRunning = true
 	tsm.state = TailscaleServiceStateRunning
 	tsm.startTime = time.Now()
+
+	// 启动认证密钥过期监控
+	go tsm.monitorAuthKeyExpiration(tsm.ctx)
 
 	tsm.updateHealthStatus(true, nil)
 	logging.Infof("Tailscale service started successfully for node: %s in %s mode", tsm.hostname, mode)
@@ -301,6 +355,12 @@ func (tsm *TailscaleService) Stop(ctx context.Context) error {
 
 	if !tsm.isRunning {
 		return nil
+	}
+
+	// 清理 IP 规则
+	if cleanupErr := tsm.cleanupIPRules(); cleanupErr != nil {
+		logging.Warnf("Failed to cleanup IP rules: %v", cleanupErr)
+		// 不将清理失败作为主要错误返回，但记录警告
 	}
 
 	// 停止 Tailscale 服务
@@ -549,7 +609,8 @@ func (tsm *TailscaleService) checkSystemState() (socketExists, stateExists, proc
 	// 检查网络接口
 	interfaceName := tsm.tailscaleEnv.tailscaleNic
 	if interfaceName == "" {
-		interfaceName = "tailscale0"
+		logging.Debugf("No interface name specified, skipping interface check")
+		return
 	}
 	if _, err := os.Stat(fmt.Sprintf("/sys/class/net/%s", interfaceName)); err == nil {
 		interfaceExists = true
@@ -615,6 +676,7 @@ func (tsm *TailscaleService) startFreshTailscaled() error {
 		ControlURL: tsm.preparer.GetConfig().Tailscale.URL,
 		SocketPath: tsm.tailscaleEnv.socketPath,
 		StateFile:  tsm.tailscaleEnv.statePath,
+		ConfigDir:  tsm.tailscaleEnv.configDir, // 添加配置目录字段
 		Mode:       tailscale.ModeStandaloneTailscaled,
 	})
 	if err != nil {
@@ -641,6 +703,11 @@ func (tsm *TailscaleService) cleanupAndRestartTailscaled() error {
 
 // [DAEMON] cleanupTailscaleFiles 清理 Tailscale 相关文件
 func (tsm *TailscaleService) cleanupTailscaleFiles() {
+	if tsm.preparer.GetConfig().Tailscale.Mode == "host" {
+		return
+	}
+
+	// 安全检查：确保不会清理系统文件
 	files := []string{
 		tsm.tailscaleEnv.socketPath,
 		tsm.tailscaleEnv.statePath,
@@ -649,6 +716,15 @@ func (tsm *TailscaleService) cleanupTailscaleFiles() {
 
 	for _, file := range files {
 		if file != "" {
+			// 额外安全检查：确保不会删除系统文件
+			if strings.Contains(file, "/var/lib/tailscale") ||
+				strings.Contains(file, "/usr") ||
+				strings.Contains(file, "/opt") ||
+				strings.Contains(file, "/var/run/tailscale") {
+				logging.Warnf("跳过系统文件清理: %s", file)
+				continue
+			}
+
 			if err := os.Remove(file); err != nil && !os.IsNotExist(err) {
 				logging.Warnf("Failed to remove file %s: %v", file, err)
 			} else {
@@ -682,6 +758,7 @@ func (tsm *TailscaleService) restartWithExistingData() error {
 		ControlURL: tsm.preparer.GetConfig().Tailscale.URL,
 		SocketPath: tsm.tailscaleEnv.socketPath,
 		StateFile:  tsm.tailscaleEnv.statePath,
+		ConfigDir:  tsm.tailscaleEnv.configDir, // 添加配置目录字段
 		Mode:       tailscale.ModeStandaloneTailscaled,
 	})
 	if err != nil {
@@ -707,20 +784,63 @@ func (tsm *TailscaleService) cleanupInterfaceAndStartFresh() error {
 
 // [DAEMON] cleanupTailscaleInterface 清理 Tailscale 网络接口
 func (tsm *TailscaleService) cleanupTailscaleInterface() error {
-	interfaceName := tsm.tailscaleEnv.tailscaleNic
-	if interfaceName == "" {
-		interfaceName = "tailscale0"
-	}
-
-	// 尝试删除网络接口
-	cmd := exec.Command("ip", "link", "delete", interfaceName)
-	if err := cmd.Run(); err != nil {
-		// 如果删除失败，记录警告但不返回错误
-		logging.Warnf("Failed to delete interface %s: %v", interfaceName, err)
+	if tsm.preparer.GetConfig().Tailscale.Mode == "host" {
 		return nil
 	}
 
-	logging.Infof("Successfully cleaned up Tailscale interface: %s", interfaceName)
+	interfaceName := tsm.tailscaleEnv.tailscaleNic
+	if interfaceName == "" {
+		logging.Warnf("No interface name specified, skipping interface cleanup")
+		return nil
+	}
+
+	// 安全检查：避免误删系统接口
+	protectedInterfaces := []string{
+		"tailscale0", // 主机 Tailscale 接口
+		"eth0",       // 主要网络接口
+		"ens",        // 现代 Linux 网络接口前缀
+		"eno",        // 板载网络接口
+		"enp",        // PCI 网络接口
+		"lo",         // 回环接口
+		"docker0",    // Docker 网桥
+		"br-",        // Docker 网桥前缀
+		"veth",       // 虚拟以太网接口
+		"cali",       // Calico 接口
+		"flannel",    // Flannel 接口
+		"cni0",       // CNI 接口
+		"weave",      // Weave 接口
+	}
+
+	// 检查是否为受保护的系统接口
+	for _, protected := range protectedInterfaces {
+		if strings.HasPrefix(interfaceName, protected) || interfaceName == protected {
+			logging.Warnf("Skipping cleanup of protected system interface: %s", interfaceName)
+			return nil
+		}
+	}
+
+	// 在 Pod 环境中，ip 命令可能不可用，改用 netlink
+	// 使用 netlink 删除网络接口
+	links, err := netlink.LinkList()
+	if err != nil {
+		logging.Warnf("Failed to list network links: %v", err)
+		return nil
+	}
+
+	// 查找并删除指定的接口
+	for _, link := range links {
+		if link.Attrs().Name == interfaceName {
+			if err := netlink.LinkDel(link); err != nil {
+				// 如果删除失败，记录警告但不返回错误
+				logging.Warnf("Failed to delete interface %s: %v", interfaceName, err)
+			} else {
+				logging.Infof("Successfully cleaned up Tailscale interface: %s", interfaceName)
+			}
+			return nil
+		}
+	}
+
+	logging.Debugf("Interface %s not found, nothing to clean up", interfaceName)
 	return nil
 }
 
@@ -728,12 +848,22 @@ func (tsm *TailscaleService) cleanupTailscaleInterface() error {
 func (tsm *TailscaleService) checkDaemonConfigFiles(configDir string) error {
 	logging.Infof("Checking daemon config files in: %s", configDir)
 
+	// 验证配置目录路径
+	if configDir == "" {
+		return fmt.Errorf("config directory path is empty")
+	}
+
 	// 检查配置目录是否存在
 	if _, err := os.Stat(configDir); os.IsNotExist(err) {
+		logging.Infof("Config directory does not exist, creating: %s", configDir)
 		if err := os.MkdirAll(configDir, 0755); err != nil {
-			return fmt.Errorf("failed to create config directory: %v", err)
+			return fmt.Errorf("failed to create config directory '%s': %v", configDir, err)
 		}
+		logging.Infof("Successfully created config directory: %s", configDir)
+	} else if err != nil {
+		return fmt.Errorf("failed to check config directory '%s': %v", configDir, err)
 	}
+
 	return nil
 }
 
@@ -852,7 +982,10 @@ func (tsm *TailscaleService) waitForDaemonReady() error {
 func (tsm *TailscaleService) setupAndManageRoutes(node *coreV1.Node) error {
 	logging.Infof("Setting up and managing routes for node: %s", node.Name)
 
-	podLocalCIDR := k8s.GetNodePodCIDR(node)
+	podLocalCIDR, err := tsm.preparer.GetK8sClient().Nodes().GetPodCIDR(node.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %w", node.Name, err)
+	}
 	if podLocalCIDR == "" {
 		return fmt.Errorf("no Pod CIDR found for node %s", node.Name)
 	}
@@ -897,8 +1030,257 @@ func (tsm *TailscaleService) setupAndManageRoutes(node *coreV1.Node) error {
 		// 不返回错误，继续执行
 	}
 
+	// 启动规则监控和维护
+	go tsm.monitorAndMaintainRules()
+
 	logging.Infof("Route setup completed")
 	return nil
+}
+
+func isSameNetwork(ip1, ip2 net.IP) bool {
+	// 如果都是IPv4，检查前2个字节是否相同 (相当于/16网段)
+	if ip1.To4() != nil && ip2.To4() != nil {
+		ip1v4 := ip1.To4()
+		ip2v4 := ip2.To4()
+		return ip1v4[0] == ip2v4[0] && ip1v4[1] == ip2v4[1]
+	}
+	return false
+}
+
+func (tsm *TailscaleService) addIPRuleInHost() error {
+	//ip rule add from <tailscale_ip> lookup 53 priority 153
+	//ip rule add to <pod_local_cidr> table main priority 152
+	tailscaleIP, err := tsm.preparer.GetTailscaleClient().GetIP(context.Background())
+	if err != nil {
+		logging.Warnf("Failed to get tailscale ip: %v", err)
+		return err
+	}
+
+	nodeName, err := tsm.preparer.GetK8sClient().GetCurrentNodeName()
+	if err != nil {
+		tsm.updateHealthStatus(false, err)
+		return tsm.handleErrorWithLog(err, "Failed to get current node name: %w", err)
+	}
+	podLocalCIDR, err := tsm.preparer.GetK8sClient().Nodes().GetPodCIDR(nodeName)
+	if err != nil {
+		logging.Warnf("Failed to get pod local cidr: %v", err)
+		return err
+	}
+	// 将 podLocalCIDR 转换为 *net.IPNet
+	_, podLocalCIDRNet, err := net.ParseCIDR(podLocalCIDR)
+	if err != nil {
+		logging.Warnf("Failed to parse pod local cidr: %v", err)
+		return err
+	}
+
+	// 检查当前规则列表
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		logging.Warnf("Failed to get rules: %v", err)
+		return err
+	}
+
+	// 检查机器上是否有tailscale0的ip
+	localIP, err := tsm.preparer.GetTailscaleClient().GetLocalIP(context.Background())
+	if err == nil {
+		if localIP.String() != tailscaleIP.String() {
+			if err := tsm.manageRule(rules, localIP, nil, 52, 3152, "from"); err != nil {
+				logging.Warnf("Failed to add local IP rule: %v", err)
+			}
+		}
+	}
+
+	// 添加两个规则（并行执行，互不影响）
+	if err := tsm.manageRule(rules, tailscaleIP, nil, 53, 3153, "from"); err != nil {
+		logging.Warnf("Failed to add tailscale IP rule: %v", err)
+	}
+
+	if err := tsm.manageRule(rules, netip.Addr{}, podLocalCIDRNet, 254, 3151, "to"); err != nil {
+		logging.Warnf("Failed to add pod CIDR rule: %v", err)
+	}
+
+	return nil
+}
+
+// 通用的规则管理函数
+func (tsm *TailscaleService) manageRule(existingRules []netlink.Rule, srcIP netip.Addr, dstNet *net.IPNet, table, priority int, ruleType string) error {
+	// 检查是否已存在完全匹配的规则
+	for _, rule := range existingRules {
+		if tsm.isRuleMatch(rule, srcIP, dstNet, table, priority, ruleType) {
+			logging.Infof("%s rule already exists: %s %s lookup %d priority %d",
+				strings.Title(ruleType), ruleType, tsm.getRuleDescription(srcIP, dstNet), table, priority)
+			return nil
+		}
+	}
+
+	// 删除同网段的旧规则
+	if err := tsm.deleteOldRules(existingRules, srcIP, dstNet, table, priority, ruleType); err != nil {
+		return err
+	}
+
+	// 添加新规则
+	return tsm.addNewRule(srcIP, dstNet, table, priority, ruleType)
+}
+
+// 检查规则是否匹配
+func (tsm *TailscaleService) isRuleMatch(rule netlink.Rule, srcIP netip.Addr, dstNet *net.IPNet, table, priority int, ruleType string) bool {
+	if rule.Priority != priority || rule.Table != table {
+		return false
+	}
+
+	if ruleType == "from" {
+		return rule.Src != nil &&
+			srcIP.IsValid() &&
+			rule.Src.IP.Equal(srcIP.AsSlice()) &&
+			rule.Src.Mask.String() == net.CIDRMask(32, 32).String() &&
+			rule.Dst == nil
+	} else { // to rule
+		return rule.Dst != nil &&
+			dstNet != nil &&
+			rule.Dst.IP.Equal(dstNet.IP) &&
+			rule.Dst.Mask.String() == dstNet.Mask.String() &&
+			rule.Src == nil
+	}
+}
+
+// 删除旧规则
+func (tsm *TailscaleService) deleteOldRules(existingRules []netlink.Rule, srcIP netip.Addr, dstNet *net.IPNet, table, priority int, ruleType string) error {
+	var rulesToDelete []*netlink.Rule
+
+	for _, rule := range existingRules {
+		if rule.Priority == priority && rule.Table == table {
+			if ruleType == "from" && rule.Src != nil && rule.Dst == nil {
+				if isSameNetwork(rule.Src.IP, srcIP.AsSlice()) && !rule.Src.IP.Equal(srcIP.AsSlice()) {
+					ruleCopy := rule
+					rulesToDelete = append(rulesToDelete, &ruleCopy)
+					logging.Infof("Found old from rule in same network to delete: from %s lookup %d priority %d",
+						rule.Src.IP.String(), table, priority)
+				}
+			} else if ruleType == "to" && rule.Dst != nil && rule.Src == nil {
+				if rule.Dst.String() == dstNet.String() {
+					ruleCopy := rule
+					rulesToDelete = append(rulesToDelete, &ruleCopy)
+					logging.Infof("Found old to rule to delete: to %s table main priority %d",
+						rule.Dst.String(), priority)
+				}
+			}
+		}
+	}
+
+	// 删除旧规则
+	for _, rule := range rulesToDelete {
+		if err := netlink.RuleDel(rule); err != nil {
+			logging.Warnf("Failed to delete old %s rule %v: %v", ruleType, rule, err)
+		} else {
+			logging.Infof("Deleted old %s rule: %s %s lookup %d priority %d",
+				ruleType, ruleType, tsm.getRuleDescription(srcIP, dstNet), table, priority)
+		}
+	}
+
+	return nil
+}
+
+// 添加新规则
+func (tsm *TailscaleService) addNewRule(srcIP netip.Addr, dstNet *net.IPNet, table, priority int, ruleType string) error {
+	newRule := netlink.NewRule()
+	newRule.Table = table
+	newRule.Priority = priority
+
+	if ruleType == "from" {
+		ip := net.IP(srcIP.AsSlice()).To4()
+		if ip == nil {
+			return fmt.Errorf("invalid IPv4 address: %s", srcIP)
+		}
+		newRule.Src = &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(32, 32),
+		}
+	} else { // to rule
+		newRule.Dst = &net.IPNet{
+			IP:   dstNet.IP,
+			Mask: dstNet.Mask,
+		}
+	}
+
+	var tableName string
+	if table == 254 {
+		tableName = "main"
+	} else {
+		tableName = fmt.Sprintf("%d", table)
+	}
+	logging.Infof("Attempting to add %s rule: %s %s lookup %s priority %d",
+		ruleType, ruleType, tsm.getRuleDescription(srcIP, dstNet), tableName, priority)
+
+	if err := netlink.RuleAdd(newRule); err != nil {
+		logging.Warnf("Failed to add %s rule: %v", ruleType, err)
+		return err
+	}
+
+	logging.Infof("Successfully added %s rule: %s %s lookup %s priority %d",
+		ruleType, ruleType, tsm.getRuleDescription(srcIP, dstNet), tableName, priority)
+	return nil
+}
+
+// cleanupIPRules 清理之前添加的 IP 规则
+func (tsm *TailscaleService) cleanupIPRules() error {
+	logging.Infof("Cleaning up IP rules...")
+
+	// 获取当前规则列表
+	rules, err := netlink.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		logging.Warnf("Failed to get rules for cleanup: %v", err)
+		return err
+	}
+
+	// 清理我们添加的规则（优先级 3151, 3152, 3153）
+	prioritiesToClean := []int{3151, 3152, 3153}
+
+	for _, priority := range prioritiesToClean {
+		for _, rule := range rules {
+			if rule.Priority == priority {
+				if err := netlink.RuleDel(&rule); err != nil {
+					logging.Warnf("Failed to delete rule with priority %d: %v", priority, err)
+				} else {
+					logging.Infof("Successfully deleted rule with priority %d", priority)
+				}
+			}
+		}
+	}
+
+	logging.Infof("IP rules cleanup completed")
+	return nil
+}
+
+// 获取规则描述
+func (tsm *TailscaleService) getRuleDescription(srcIP netip.Addr, dstNet *net.IPNet) string {
+	if srcIP.IsValid() {
+		return srcIP.String()
+	}
+	if dstNet != nil {
+		return dstNet.String()
+	}
+	return ""
+}
+
+// monitorAndMaintainRules 持续监控和维护 IP 规则
+func (tsm *TailscaleService) monitorAndMaintainRules() {
+	if err := tsm.addIPRuleInHost(); err != nil {
+		logging.Warnf("Failed first time to add ip rule in host: %v", err)
+	}
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := tsm.addIPRuleInHost(); err != nil {
+				logging.Warnf("Failed to add ip rule in host: %v", err)
+			}
+		case <-tsm.ctx.Done():
+			return
+		}
+	}
 }
 
 // getTailscaleInfo 获取 Tailscale IP 和节点密钥
@@ -928,72 +1310,185 @@ func (tsm *TailscaleService) getTailscaleInfo() (net.IP, string, error) {
 
 // [PUBLIC] attemptLogin 尝试自动登录
 func (tsm *TailscaleService) attemptLogin() error {
+	logging.Infof("Starting automatic login process for node: %s", tsm.hostname)
+
 	// 策略1: 优先尝试使用现有的认证信息（"auto"模式）
-	logging.Infof("Attempting login with existing credentials first")
+	logging.Infof("策略1: 尝试使用现有认证信息（auto模式）")
 	if err := tsm.tryLoginWithExistingCredentials(); err == nil {
-		logging.Infof("Login with existing credentials successful")
+		logging.Infof("✅ 使用现有认证信息登录成功")
 		return nil
 	}
-	logging.Infof("Existing credentials login failed, will try with auth key")
+	logging.Infof("现有认证信息登录失败，将尝试其他策略")
 
-	// 策略2: 如果现有认证失败，检查是否有有效的 authKey
-	if tsm.authKey != "" && (!tsm.authKeyExpiredTime.IsZero() && tsm.authKeyExpiredTime.After(time.Now())) {
-		logging.Infof("Attempting login with stored auth key")
+	// 策略2: 检查是否有有效的 authKey（从 Headscale 获取的）
+	tsm.cleanupExpiredAuthKey() // 清理过期的密钥
+
+	if tsm.validateAuthKey() {
+		logging.Infof("策略2: 尝试使用存储的认证密钥")
 		if err := tsm.tryLoginWithAuthKey(); err == nil {
-			logging.Infof("Login with auth key successful")
+			logging.Infof("✅ 使用认证密钥登录成功")
 			return nil
 		}
-		logging.Warnf("Auth key login failed")
-	} else if tsm.authKey != "" && (!tsm.authKeyExpiredTime.IsZero() && tsm.authKeyExpiredTime.Before(time.Now())) {
-		logging.Infof("Stored auth key expired at %v, will get new one", tsm.authKeyExpiredTime)
-		tsm.authKey = "" // 清空过期的密钥
+		logging.Warnf("认证密钥登录失败")
+	} else {
+		logging.Infof("没有有效的存储认证密钥")
 	}
 
 	// 策略3: 从 Headscale 获取新的认证密钥
-	logging.Infof("No valid credentials available, attempting to get new one from Headscale")
+	logging.Infof("策略3: 从 Headscale 获取新的认证密钥")
 	return tsm.refreshAuthKeyFromHeadscale()
 }
 
 // tryLoginWithExistingCredentials 尝试使用现有认证信息登录
 func (tsm *TailscaleService) tryLoginWithExistingCredentials() error {
-	logging.Infof("Attempting login with existing credentials")
+	logging.Infof("尝试使用现有认证信息登录")
 
-	err := tsm.preparer.GetTailscaleClient().UpWithOptions(context.Background(), tailscale.ClientOptions{
-		AuthKey:      "auto", // 使用已保存的认证信息
-		Hostname:     tsm.hostname,
-		ControlURL:   tsm.preparer.GetConfig().Tailscale.URL,
-		AcceptRoutes: true,
-		ShieldsUp:    false,
-	})
+	// 首先检查当前状态
+	status, err := tsm.preparer.GetTailscaleClient().GetStatus(context.Background())
+	if err != nil {
+		return fmt.Errorf("无法获取当前状态: %v", err)
+	}
 
-	if err == nil {
-		logging.Infof("Auto-login with existing credentials successful")
+	logging.Infof("当前状态: %s, 是否有NodeKey: %v", status.BackendState, status.HaveNodeKey)
+
+	// 如果已经有有效的连接，直接返回成功
+	if status.BackendState == "Running" && status.Self != nil && len(status.Self.TailscaleIPs) > 0 {
+		logging.Infof("✅ 已经处于运行状态且有有效IP: %v", status.Self.TailscaleIPs)
 		return nil
 	}
 
-	logging.Debugf("Existing credentials login failed: %v", err)
-	return err
+	// 如果有NodeKey但未运行，尝试启用运行状态
+	if status.HaveNodeKey {
+		logging.Infof("检测到现有NodeKey，尝试启用运行状态")
+
+		// 使用 "auto" 模式尝试连接
+		err := tsm.preparer.GetTailscaleClient().UpWithOptions(context.Background(), tailscale.ClientOptions{
+			AcceptDNS:    tsm.preparer.GetConfig().Tailscale.AcceptDNS,
+			AuthKey:      "auto", // 使用已保存的认证信息
+			Hostname:     tsm.tailscaleEnv.hostName,
+			ControlURL:   tsm.preparer.GetConfig().Tailscale.URL,
+			AcceptRoutes: true,
+			ShieldsUp:    false,
+		})
+
+		if err == nil {
+			logging.Infof("✅ 使用auto模式成功启用现有认证")
+			return nil
+		}
+
+		logging.Debugf("auto模式启用失败: %v", err)
+		return err
+	}
+
+	// 如果没有现有认证信息，返回错误
+	return fmt.Errorf("没有可用的现有认证信息")
 }
 
 // tryLoginWithAuthKey 尝试使用认证密钥登录
 func (tsm *TailscaleService) tryLoginWithAuthKey() error {
-	logging.Infof("Attempting login with auth key")
+	logging.Infof("尝试使用认证密钥登录")
+
+	// 验证认证密钥是否仍然有效
+	if !tsm.validateAuthKey() {
+		return fmt.Errorf("认证密钥已过期或无效")
+	}
 
 	err := tsm.preparer.GetTailscaleClient().UpWithOptions(context.Background(), tailscale.ClientOptions{
+		AcceptDNS:    tsm.preparer.GetConfig().Tailscale.AcceptDNS,
 		AuthKey:      tsm.authKey,
-		Hostname:     tsm.hostname,
+		Hostname:     tsm.tailscaleEnv.hostName,
 		ControlURL:   tsm.preparer.GetConfig().Tailscale.URL,
 		AcceptRoutes: true,
 		ShieldsUp:    false,
 	})
 
 	if err == nil {
-		logging.Infof("Login with auth key successful")
+		logging.Infof("✅ 使用认证密钥登录成功")
 		return nil
 	}
 
-	logging.Debugf("Auth key login failed: %v", err)
+	logging.Debugf("认证密钥登录失败: %v", err)
 	return err
+}
+
+// refreshAuthKeyFromHeadscale 从 Headscale 获取新的认证密钥
+func (tsm *TailscaleService) refreshAuthKeyFromHeadscale() error {
+	logging.Infof("从 Headscale 刷新认证密钥")
+
+	// 获取当前节点信息以确定用户
+	node, err := tsm.preparer.GetK8sClient().GetCurrentNode()
+	if err != nil {
+		return fmt.Errorf("无法获取当前节点: %v", err)
+	}
+
+	// 从节点标签或注解中获取用户信息，如果没有则使用默认用户
+	user := tsm.preparer.GetConfig().Tailscale.User
+	if user == "" {
+		user = "default" // 默认用户
+	}
+
+	// Headscale 要求 tag 必须以 "tag:" 开头
+	aclTags := make([]string, 0)
+	for _, tag := range tsm.preparer.GetConfig().Tailscale.Tags {
+		if !strings.HasPrefix(tag, "tag:") {
+			tag = "tag:" + tag
+		}
+		aclTags = append(aclTags, tag)
+	}
+
+	// 添加节点标签，确保格式正确
+	if node.Name != "" {
+		nodeTag := fmt.Sprintf("tag:node:%s", node.Name)
+		aclTags = append(aclTags, nodeTag)
+	}
+
+	logging.Infof("为用户创建预授权密钥: %s, 标签: %v", user, aclTags)
+
+	// 创建预授权密钥请求
+	preAuthKeyReq := &headscale.CreatePreAuthKeyRequest{
+		User:       user,
+		Reusable:   false, // 一次性使用
+		Ephemeral:  false, // 非临时节点
+		AclTags:    aclTags,
+		Expiration: time.Now().Add(24 * time.Hour), // 24小时有效期
+	}
+
+	// 从 Headscale 创建新的预授权密钥，带重试机制
+	var preAuthResp *headscale.CreatePreAuthKeyResponse
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var err error
+		preAuthResp, err = tsm.preparer.GetHeadscaleClient().CreatePreAuthKey(context.Background(), preAuthKeyReq)
+		if err == nil {
+			break
+		}
+
+		if attempt == maxRetries {
+			return fmt.Errorf("从 Headscale 创建预授权密钥失败，尝试 %d 次后失败: %v", maxRetries, err)
+		}
+
+		logging.Warnf("尝试 %d 失败: %v, 5秒后重试...", attempt, err)
+		time.Sleep(5 * time.Second)
+	}
+
+	if preAuthResp.PreAuthKey.Key == "" {
+		return fmt.Errorf("从 Headscale 接收到空的预授权密钥")
+	}
+
+	// 更新本地的 authKey
+	tsm.authKey = preAuthResp.PreAuthKey.Key
+	tsm.authKeyExpiredTime = preAuthResp.PreAuthKey.Expiration
+	logging.Infof("✅ 成功从 Headscale 刷新认证密钥，过期时间: %v", tsm.authKeyExpiredTime)
+
+	// 使用新的认证密钥尝试登录
+	return tsm.preparer.GetTailscaleClient().UpWithOptions(context.Background(), tailscale.ClientOptions{
+		AuthKey:      tsm.authKey,
+		Hostname:     tsm.tailscaleEnv.hostName,
+		ControlURL:   tsm.preparer.GetConfig().Tailscale.URL,
+		AcceptDNS:    tsm.preparer.GetConfig().Tailscale.AcceptDNS,
+		AcceptRoutes: true,
+		ShieldsUp:    false,
+	})
 }
 
 // [PUBLIC] checkLocalPodCIDRApplied 检查本地 Pod CIDR 是否已应用
@@ -1003,7 +1498,10 @@ func (tsm *TailscaleService) checkLocalPodCIDRApplied() error {
 		return fmt.Errorf("failed to get current node: %v", err)
 	}
 
-	podLocalCIDR := k8s.GetNodePodCIDR(node)
+	podLocalCIDR, err := tsm.preparer.GetK8sClient().Nodes().GetPodCIDR(node.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %w", node.Name, err)
+	}
 	if podLocalCIDR == "" {
 		return fmt.Errorf("no Pod CIDR found for node %s", node.Name)
 	}
@@ -1089,10 +1587,13 @@ func (tsm *TailscaleService) checkHeadscaleRoutes() error {
 	// 获取当前节点信息
 	node, err := tsm.preparer.GetK8sClient().GetCurrentNode()
 	if err != nil {
-		return fmt.Errorf("failed to get current node: %v", err)
+		return fmt.Errorf("failed to get current node: %w", err)
 	}
 
-	podLocalCIDR := k8s.GetNodePodCIDR(node)
+	podLocalCIDR, err := tsm.preparer.GetK8sClient().Nodes().GetPodCIDR(node.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %w", node.Name, err)
+	}
 
 	// 检查 Headscale 路由
 	routes, err := tsm.preparer.GetHeadscaleClient().GetRoutes(context.Background())
@@ -1156,7 +1657,10 @@ func (tsm *TailscaleService) uploadTailscaleInfo(tailscaleIP net.IP, nodeKey str
 	if err != nil {
 		return fmt.Errorf("failed to get current node: %v", err)
 	}
-	podLocalCIDR := k8s.GetNodePodCIDR(node)
+	podLocalCIDR, err := tsm.preparer.GetK8sClient().Nodes().GetPodCIDR(node.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %w", node.Name, err)
+	}
 
 	// 使用 k8s 包的注解功能
 	annotations := map[string]string{
@@ -1165,7 +1669,7 @@ func (tsm *TailscaleService) uploadTailscaleInfo(tailscaleIP net.IP, nodeKey str
 		constants.HeadcniPodCIDRAnnotationKey:     podLocalCIDR,
 	}
 
-	return tsm.preparer.GetK8sClient().SetNodeAnnotations(node, annotations)
+	return tsm.preparer.GetK8sClient().Nodes().UpdateAnnotations(node.Name, annotations)
 }
 
 // [PUBLIC] GetState 获取服务状态
@@ -1188,59 +1692,6 @@ func (tsm *TailscaleService) GetServiceInfo() map[string]interface{} {
 		"lastError":   tsm.lastError,
 		"retryCount":  tsm.retryCount,
 	}
-}
-
-// refreshAuthKeyFromHeadscale 从 Headscale 获取新的认证密钥
-// [PUBLIC] refreshAuthKeyFromHeadscale 从 Headscale 刷新认证密钥
-func (tsm *TailscaleService) refreshAuthKeyFromHeadscale() error {
-	logging.Infof("Refreshing auth key from Headscale")
-
-	// 获取当前节点信息以确定用户
-	node, err := tsm.preparer.GetK8sClient().GetCurrentNode()
-	if err != nil {
-		return fmt.Errorf("failed to get current node: %v", err)
-	}
-
-	// 从节点标签或注解中获取用户信息，如果没有则使用默认用户
-	user := tsm.preparer.GetConfig().Tailscale.User
-	if user == "" {
-		user = "default" // 默认用户
-	}
-	aclTags := tsm.preparer.GetConfig().Tailscale.Tags
-	aclTags = append(aclTags, fmt.Sprintf("node:%s", node.Name))
-
-	// 创建预授权密钥请求
-	preAuthKeyReq := &headscale.CreatePreAuthKeyRequest{
-		User:       user,
-		Reusable:   false, // 一次性使用
-		Ephemeral:  false, // 非临时节点
-		AclTags:    aclTags,
-		Expiration: time.Now().Add(24 * time.Hour), // 24小时有效期
-	}
-
-	// 从 Headscale 创建新的预授权密钥
-	preAuthResp, err := tsm.preparer.GetHeadscaleClient().CreatePreAuthKey(context.Background(), preAuthKeyReq)
-	if err != nil {
-		return fmt.Errorf("failed to create pre-auth key from Headscale: %v", err)
-	}
-
-	if preAuthResp.PreAuthKey.Key == "" {
-		return fmt.Errorf("received empty pre-auth key from Headscale")
-	}
-
-	// 更新本地的 authKey
-	tsm.authKey = preAuthResp.PreAuthKey.Key
-	tsm.authKeyExpiredTime = preAuthResp.PreAuthKey.Expiration
-	logging.Infof("Successfully refreshed auth key from Headscale")
-
-	// 使用新的认证密钥尝试登录
-	return tsm.preparer.GetTailscaleClient().UpWithOptions(context.Background(), tailscale.ClientOptions{
-		AuthKey:      tsm.authKey,
-		Hostname:     tsm.hostname,
-		ControlURL:   tsm.preparer.GetConfig().Tailscale.URL,
-		AcceptRoutes: true,
-		ShieldsUp:    false,
-	})
 }
 
 // [PUBLIC] getCurrentNodeID 获取当前节点 ID
@@ -1356,4 +1807,63 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// =============================================================================
+// Utility Functions
+// =============================================================================
+
+// validateAndEnsureDir 验证并确保目录路径有效，如果无效则使用默认路径
+func validateAndEnsureDir(path string, defaultPath string) string {
+	if path == "" || path == "." || path == "/" {
+		logging.Warnf("Invalid directory path: %s, using default: %s", path, defaultPath)
+		return defaultPath
+	}
+
+	// 检查路径是否包含无效字符
+	if strings.Contains(path, "..") || strings.Contains(path, "//") {
+		logging.Warnf("Suspicious directory path: %s, using default: %s", path, defaultPath)
+		return defaultPath
+	}
+
+	return path
+}
+
+// =============================================================================
+// Tailscale Service Implementation
+// =============================================================================
+
+// monitorAuthKeyExpiration 监控认证密钥过期时间，在即将过期时自动刷新
+func (tsm *TailscaleService) monitorAuthKeyExpiration(ctx context.Context) {
+	ticker := time.NewTicker(1 * time.Hour) // 每小时检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			tsm.checkAndRefreshAuthKeyIfNeeded()
+		}
+	}
+}
+
+// checkAndRefreshAuthKeyIfNeeded 检查并在需要时刷新认证密钥
+func (tsm *TailscaleService) checkAndRefreshAuthKeyIfNeeded() {
+	if !tsm.validateAuthKey() {
+		return
+	}
+
+	// 如果密钥在 2 小时内过期，提前刷新
+	expiresIn := time.Until(tsm.authKeyExpiredTime)
+	if expiresIn > 0 && expiresIn < 2*time.Hour {
+		logging.Infof("Auth key expires in %v, refreshing early", expiresIn)
+
+		// 在后台刷新密钥，避免阻塞主流程
+		go func() {
+			if err := tsm.refreshAuthKeyFromHeadscale(); err != nil {
+				logging.Errorf("Failed to refresh auth key in background: %v", err)
+			}
+		}()
+	}
 }

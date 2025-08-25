@@ -44,6 +44,10 @@ func (s *MonitoringService) Start(ctx context.Context) error {
 		return nil
 	}
 
+	// 监控服务始终启动，因为健康检查是基础功能
+	// 即使 Monitoring.Enabled 为 false，健康检查端点仍然可用
+	logging.Infof("Starting monitoring service (health check always enabled)")
+
 	// 创建并启动 HTTP 服务器
 	if err := s.startHTTPServer(); err != nil {
 		// 更新健康状态为失败
@@ -130,7 +134,7 @@ func (s *MonitoringService) Reload(ctx context.Context) error {
 		logging.Errorf("Failed to stop service during reload: %v", err)
 	}
 
-	// 重新启动服务
+	// 重新启动服务（健康检查始终可用，metrics 根据配置决定）
 	if err := s.Start(ctx); err != nil {
 		logging.Errorf("Failed to restart service during reload: %v", err)
 		return err
@@ -159,14 +163,20 @@ func (s *MonitoringService) getPort() int {
 // startHTTPServer 启动 HTTP 服务器
 func (s *MonitoringService) startHTTPServer() error {
 	port := s.getPort()
+	monitoringEnabled := s.preparer.GetConfig().Monitoring.Enabled
 
 	mux := http.NewServeMux()
 
-	// 健康检查端点
+	// 健康检查端点始终可用
 	mux.HandleFunc("/health", s.handleHealth)
 
-	// Prometheus 指标端点
-	mux.Handle("/metrics", monitoring.GetPrometheusHandler())
+	// Prometheus 指标端点根据配置决定
+	if monitoringEnabled {
+		mux.Handle("/metrics", monitoring.GetPrometheusHandler())
+		logging.Infof("HTTP server started on port %d with /health and /metrics endpoints", port)
+	} else {
+		logging.Infof("HTTP server started on port %d with /health endpoint only (metrics disabled)", port)
+	}
 
 	s.httpServer = &http.Server{
 		Addr:    ":" + strconv.Itoa(port),
@@ -180,7 +190,6 @@ func (s *MonitoringService) startHTTPServer() error {
 		}
 	}()
 
-	logging.Infof("HTTP server started on port %d with /health and /metrics endpoints", port)
 	return nil
 }
 
@@ -207,12 +216,15 @@ func (s *MonitoringService) GetMetrics() map[string]interface{} {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	monitoringEnabled := s.preparer.GetConfig().Monitoring.Enabled
+
 	metrics := map[string]interface{}{
-		"service_name": s.Name(),
-		"running":      s.running,
-		"port":         s.getPort(),
-		"enabled":      s.preparer.GetConfig().Monitoring.Enabled,
-		"timestamp":    time.Now().UTC().Format(time.RFC3339),
+		"service_name":            s.Name(),
+		"running":                 s.running,
+		"port":                    s.getPort(),
+		"monitoring_enabled":      monitoringEnabled,
+		"health_always_available": true, // 健康检查始终可用
+		"timestamp":               time.Now().UTC().Format(time.RFC3339),
 	}
 
 	if s.running {

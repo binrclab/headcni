@@ -49,7 +49,7 @@ func TestGenerateConfigList(t *testing.T) {
 	}
 
 	// 生成配置列表
-	configList, err := manager.GenerateConfigList("10.244.0.0/16", testConfig)
+	configList, err := manager.GenerateConfigList("10.244.0.0/16", testConfig, "10.96.0.10", "cluster.local")
 	if err != nil {
 		t.Fatalf("Failed to generate config list: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestGenerateConfigListWithHeadscaleIPAM(t *testing.T) {
 	}
 
 	// 生成配置列表
-	configList, err := manager.GenerateConfigList("10.244.0.0/16", testConfig)
+	configList, err := manager.GenerateConfigList("10.244.0.0/16", testConfig, "10.96.0.10", "cluster.local")
 	if err != nil {
 		t.Fatalf("Failed to generate config list: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestCNIConfigManagerBackup(t *testing.T) {
 			}`,
 		},
 		{
-			name: "other-file.txt",
+			name:    "other-file.txt",
 			content: "This is not a CNI config file",
 		},
 	}

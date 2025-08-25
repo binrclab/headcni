@@ -9,8 +9,6 @@ import (
 	"strings"
 
 	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
-	"github.com/binrclab/headcni/pkg/backend/tailscale"
-	"github.com/binrclab/headcni/pkg/k8s"
 	"github.com/binrclab/headcni/pkg/logging"
 )
 
@@ -111,7 +109,7 @@ func (cm *CNIConfigManager) CheckConfigListExists() (bool, error) {
 }
 
 // GenerateConfigList 生成 configlist 配置
-func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Config) (*CNIConfigList, error) {
+func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Config, dnsServiceIP, clusterDomain string) (*CNIConfigList, error) {
 	// 创建 IPAM 配置，使用 ranges 格式
 	var ipamConfig *IPAMConfig
 	if cfg.IPAM.Type == "host-local" {
@@ -140,8 +138,8 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 
 	// 映射 MagicDNS 配置（来自全局配置，若未设置则使用合理默认值）
 	// 获取默认 DNS 服务 IP
-	defaultDNSIP := k8s.GetDNSServiceIP()
-	defaultClusterDomain := k8s.GetClusterDomain()
+	defaultDNSIP := dnsServiceIP
+	defaultClusterDomain := clusterDomain
 
 	magicDNSCfg := &MagicDNSConfig{
 		Enable:        cfg.DNS.MagicDNS.Enabled,
@@ -156,6 +154,11 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 		magicDNSCfg.SearchDomains = append(magicDNSCfg.SearchDomains, cfg.DNS.MagicDNS.SearchDomains...)
 	}
 
+	interfaceName := cfg.Tailscale.InterfaceName
+	if interfaceName == "" {
+		interfaceName = "headcni01"
+	}
+
 	// 创建 HeadCNI 插件配置
 	headcniPlugin := CNIPlugin{
 		Type:                "headcni",
@@ -165,7 +168,7 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 		ServiceCIDR:         cfg.Network.ServiceCIDR,
 		EnableIPv6:          cfg.Network.EnableIPv6,
 		EnableNetworkPolicy: cfg.Network.EnableNetworkPolicy,
-		TailscaleNic:        tailscale.GetTailscaleNic(tailscale.GetServiceMode(cfg.Tailscale.Mode)), // 启用 Tailscale NIC
+		TailscaleNic:        interfaceName, // 启用 Tailscale NIC
 	}
 
 	// 创建 portmap 插件配置

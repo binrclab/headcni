@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 
@@ -24,7 +25,7 @@ type Preparer struct {
 	// 客户端
 	headscaleClient *headscale.Client
 	tailscaleClient *tailscale.SimpleClient
-	k8sClient       *k8s.Client
+	k8sClient       k8s.Client
 
 	// 管理器
 	cniConfigManager *cni.CNIConfigManager
@@ -55,19 +56,19 @@ func NewPreparer(cfg *config.Config) (*Preparer, error) {
 // prepare 按顺序准备所有系统组件
 func (p *Preparer) prepare() error {
 	// 1. 准备 Kubernetes 客户端
-	k8sClient := k8s.NewClient()
-	if err := k8sClient.Connect(); err != nil {
+	k8sClient := k8s.NewClient(&k8s.ClientConfig{})
+	if err := k8sClient.Connect(context.Background()); err != nil {
 		return fmt.Errorf("failed to connect to kubernetes: %w", err)
 	}
 
 	// 启动节点 informer
-	if err := k8sClient.StartNodeInformer(); err != nil {
+	if err := k8sClient.StartInformers(context.Background()); err != nil {
 		return fmt.Errorf("failed to start node informer: %w", err)
 	}
 
 	p.k8sClient = k8sClient
 	p.addCleanup(func() error {
-		k8sClient.Stop()
+		k8sClient.Disconnect()
 		return nil
 	})
 	logging.Infof("Kubernetes client prepared successfully")
@@ -139,7 +140,10 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 	if err != nil {
 		return fmt.Errorf("failed to get current node: %w", err)
 	}
-	currentPodCIDR := k8s.GetNodePodCIDR(node)
+	currentPodCIDR, err := p.k8sClient.Nodes().GetPodCIDR(node.Name)
+	if err != nil {
+		return fmt.Errorf("failed to get Pod CIDR for node %s: %w", node.Name, err)
+	}
 
 	logging.Infof("Current node Pod CIDR from Kubernetes API: %s", currentPodCIDR)
 
@@ -195,10 +199,14 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 		logging.Warnf("Failed to backup existing configs: %v", err)
 	}
 
+	dnsServiceIP, clusterDomain := p.getK8sOrK3sDNSAndClusterDomain()
+
 	// 生成新的 CNI 配置
 	configList, err := cniConfigManager.GenerateConfigList(
 		currentPodCIDR, // Pod CIDR
 		p.config,
+		dnsServiceIP,
+		clusterDomain,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to generate config list: %w", err)
@@ -220,6 +228,47 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 	return nil
 }
 
+func (p *Preparer) getK8sOrK3sDNSAndClusterDomain() (string, string) {
+	// 使用 k8s 客户端获取 DNS 配置
+	var dnsServiceIP, clusterDomain string
+
+	if p.k8sClient != nil {
+		// 获取 DNS 服务 IP
+		if ip, err := p.k8sClient.GetDNSServiceIP(); err == nil {
+			dnsServiceIP = ip
+		}
+		// 获取集群域名
+		if domain, err := p.k8sClient.GetClusterDomain(); err == nil {
+			clusterDomain = domain
+		}
+	}
+
+	// 如果无法获取，根据环境设置默认值
+	if dnsServiceIP == "" {
+		if p.isK3sEnvironment() {
+			dnsServiceIP = "10.43.0.10" // k3s 默认 DNS 服务 IP
+		} else {
+			dnsServiceIP = "10.96.0.10" // 标准 Kubernetes 默认 DNS 服务 IP
+		}
+	}
+
+	if clusterDomain == "" {
+		clusterDomain = "cluster.local" // 所有环境都使用相同的集群域名
+	}
+
+	return dnsServiceIP, clusterDomain
+}
+
+// isK3sEnvironment 检查是否为 k3s 环境
+func (p *Preparer) isK3sEnvironment() bool {
+	// 方法1: 检查环境变量（最可靠，不需要 API 权限）
+	if os.Getenv("K3S_DATA_DIR") != "" || os.Getenv("K3S_CONFIG") != "" {
+		return true
+	}
+	// 默认返回 false，避免误判
+	return false
+}
+
 // addCleanup 添加清理函数
 func (p *Preparer) addCleanup(cleanup func() error) {
 	p.mu.Lock()
@@ -230,7 +279,7 @@ func (p *Preparer) addCleanup(cleanup func() error) {
 // Getter 方法
 func (p *Preparer) GetHeadscaleClient() *headscale.Client       { return p.headscaleClient }
 func (p *Preparer) GetTailscaleClient() *tailscale.SimpleClient { return p.tailscaleClient }
-func (p *Preparer) GetK8sClient() *k8s.Client                   { return p.k8sClient }
+func (p *Preparer) GetK8sClient() k8s.Client                    { return p.k8sClient }
 
 func (p *Preparer) GetCNIConfigManager() *cni.CNIConfigManager     { return p.cniConfigManager }
 func (p *Preparer) GetTailscaleService() *tailscale.ServiceManager { return p.tailscaleService }

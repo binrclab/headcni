@@ -11,18 +11,38 @@ ENV GOSUMDB=sum.golang.google.cn
 # 设置工作目录
 WORKDIR /app
 
-# 复制源代码
+# 复制源代码（包括 .git 目录）
 COPY . .
+
+# #proxy
+# RUN export HTTP_PROXY=http://192.168.6.185:7897 && export HTTPS_PROXY=http://192.168.6.185:7897
+
+# 强制更新到指定分支
+RUN git submodule update --init --recursive --remote
+
+# 强制切换到微调分支
+RUN cd tailscale && \
+    git checkout v1.86.4.fine-tuned-version && \
+    echo "=== Current branch: $(git branch --show-current)" && \
+    echo "=== Current commit: $(git rev-parse HEAD)"
+
+# 验证子模块分支和内容
+RUN cd tailscale && git branch -a && git log --oneline -5 && ls -la && ls -la cmd/
 
 # 构建二进制文件
 RUN make build
 
-# 安装与代码版本一致的 Tailscale
-RUN go install tailscale.com/cmd/tailscale@v1.86.4 && \
-    go install tailscale.com/cmd/tailscaled@v1.86.4 && \
-    ls -la $(go env GOPATH)/bin/ && \
-    cp $(go env GOPATH)/bin/tailscale /app/bin/ && \
-    cp $(go env GOPATH)/bin/tailscaled /app/bin/
+# 构建子模块中的 Tailscale
+RUN cd tailscale && \
+    BRANCH_NAME=$(git branch --show-current || git name-rev --name-only HEAD | sed 's/remotes\/origin\///') && \
+    echo "=== Building from branch: $BRANCH_NAME" && \
+    echo "=== Commit hash: $(git rev-parse HEAD)" && \
+    echo "=== Remote branches: $(git branch -r | grep fine-tuned)" && \
+    echo "=== Injecting version info..." && \
+    go build -ldflags "-X tailscale.com/version.shortStamp=$BRANCH_NAME -X tailscale.com/version.longStamp=$BRANCH_NAME -X tailscale.com/version.gitCommitStamp=$(git rev-parse HEAD)" -o /app/bin/tailscale ./cmd/tailscale && \
+    go build -ldflags "-X tailscale.com/version.shortStamp=$BRANCH_NAME -X tailscale.com/version.longStamp=$BRANCH_NAME -X tailscale.com/version.gitCommitStamp=$(git rev-parse HEAD)" -o /app/bin/tailscaled ./cmd/tailscaled && \
+    ls -la /app/bin/ && \
+    echo "Tailscale binaries built from submodule source"
 
 # 运行时阶段
 FROM alpine:3.19
@@ -57,9 +77,6 @@ COPY --from=builder /app/bin/tailscaled /usr/local/bin/
 
 # 设置执行权限
 RUN chmod +x /opt/cni/bin/*
-
-# 复制配置文件
-COPY chart/templates/configmap.yaml /etc/cni/net.d/10-headcni.conflist
 
 # 设置环境变量
 ENV PATH="/opt/cni/bin:$PATH"

@@ -234,7 +234,7 @@ func DefaultConfig() (*Config, error) {
 				Name: "headcni_tailscale.sock",
 			},
 			MTU:       1280,
-			AcceptDNS: true,
+			AcceptDNS: false,
 			Hostname: HostnameConfig{
 				Prefix: "headcni-pod",
 				Type:   "hostname",

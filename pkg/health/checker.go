@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +18,7 @@ import (
 	"github.com/binrclab/headcni/pkg/ipam"
 	"github.com/binrclab/headcni/pkg/networking"
 
+	"github.com/vishvananda/netlink"
 	"k8s.io/klog/v2"
 )
 
@@ -29,6 +33,9 @@ type Config struct {
 	RecoveryTimeout         time.Duration `json:"recoveryTimeout"`
 	TailscaleRestartTimeout time.Duration `json:"tailscaleRestartTimeout"`
 	EnableMetrics           bool          `json:"enableMetrics"`
+	Tailscale               struct {
+		InterfaceName string `json:"interfaceName"`
+	} `json:"tailscale"`
 }
 
 // DefaultConfig 返回默认配置
@@ -43,6 +50,11 @@ func DefaultConfig() *Config {
 		RecoveryTimeout:         60 * time.Second,
 		TailscaleRestartTimeout: 30 * time.Second,
 		EnableMetrics:           true,
+		Tailscale: struct {
+			InterfaceName string `json:"interfaceName"`
+		}{
+			InterfaceName: "headcni01",
+		},
 	}
 }
 
@@ -331,15 +343,21 @@ func (hc *HealthChecker) checkIPAM(ctx context.Context) error {
 
 // checkNetwork 检查基本网络功能
 func (hc *HealthChecker) checkNetwork(ctx context.Context) error {
-	// 1. 检查 tailscale0 接口
-	iface, err := net.InterfaceByName("tailscale0")
+	// 获取配置的接口名称
+	interfaceName := hc.getTailscaleInterfaceName()
+	if interfaceName == "" {
+		return fmt.Errorf("no tailscale interface name configured")
+	}
+
+	// 1. 检查配置的 Tailscale 接口
+	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
-		return fmt.Errorf("tailscale0 interface not found: %v", err)
+		return fmt.Errorf("tailscale interface %s not found: %v", interfaceName, err)
 	}
 
 	// 检查接口状态
 	if iface.Flags&net.FlagUp == 0 {
-		return fmt.Errorf("tailscale0 interface is down")
+		return fmt.Errorf("tailscale interface %s is down", interfaceName)
 	}
 
 	// 2. 检查到 Tailscale IP 的连通性
@@ -349,7 +367,7 @@ func (hc *HealthChecker) checkNetwork(ctx context.Context) error {
 	}
 	tailscaleIP := net.ParseIP(ipnState.String())
 	// 3. 检查路由表
-	if err := hc.checkTailscaleRoutes(); err != nil {
+	if err := hc.checkTailscaleRoutes(interfaceName); err != nil {
 		return fmt.Errorf("tailscale routes check failed: %v", err)
 	}
 
@@ -364,17 +382,42 @@ func (hc *HealthChecker) checkNetwork(ctx context.Context) error {
 	return nil
 }
 
-// checkTailscaleRoutes 检查 Tailscale 路由
-func (hc *HealthChecker) checkTailscaleRoutes() error {
-	cmd := exec.Command("ip", "route", "show", "table", "all")
-	output, err := cmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to get routes: %v", err)
+// getTailscaleInterfaceName 获取 Tailscale 接口名称
+func (hc *HealthChecker) getTailscaleInterfaceName() string {
+	// 从配置中获取接口名称
+	if hc.config != nil && hc.config.Tailscale.InterfaceName != "" {
+		return hc.config.Tailscale.InterfaceName
 	}
 
-	// 检查是否有通过 tailscale0 的路由
-	if !contains(string(output), "dev tailscale0") {
-		return fmt.Errorf("no routes through tailscale0 interface")
+	// 如果没有配置，使用默认值
+	return "headcni01"
+}
+
+// checkTailscaleRoutes 检查 Tailscale 路由
+func (hc *HealthChecker) checkTailscaleRoutes(interfaceName string) error {
+	// 在 Pod 环境中，ip 命令可能不可用，改用 netlink
+	// 使用 netlink 获取路由信息
+	routes, err := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("failed to get routes via netlink: %v", err)
+	}
+
+	// 检查是否有通过指定接口的路由
+	hasTailscaleRoute := false
+	for _, route := range routes {
+		if route.LinkIndex > 0 {
+			// 获取接口信息
+			if link, err := netlink.LinkByIndex(route.LinkIndex); err == nil {
+				if link.Attrs().Name == interfaceName {
+					hasTailscaleRoute = true
+					break
+				}
+			}
+		}
+	}
+
+	if !hasTailscaleRoute {
+		return fmt.Errorf("no routes through tailscale interface %s", interfaceName)
 	}
 
 	return nil
@@ -420,9 +463,41 @@ func (hc *HealthChecker) checkReadiness(ctx context.Context) error {
 
 // checkLiveness 检查存活状态
 func (hc *HealthChecker) checkLiveness(ctx context.Context) error {
+	// 在 Pod 环境中，pgrep 可能不可用，改用 /proc 文件系统
 	// 检查 tailscaled 进程
-	cmd := exec.CommandContext(ctx, "pgrep", "tailscaled")
-	if err := cmd.Run(); err != nil {
+	hasTailscaledProcess := false
+
+	// 遍历 /proc 目录查找 tailscaled 进程
+	procDir, err := os.Open("/proc")
+	if err == nil {
+		defer procDir.Close()
+
+		entries, err := procDir.ReadDir(0)
+		if err == nil {
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					continue
+				}
+
+				// 检查是否是数字目录（PID）
+				if _, err := strconv.Atoi(entry.Name()); err != nil {
+					continue
+				}
+
+				// 检查进程名称
+				commPath := fmt.Sprintf("/proc/%s/comm", entry.Name())
+				if commData, err := os.ReadFile(commPath); err == nil {
+					processName := strings.TrimSpace(string(commData))
+					if processName == "tailscaled" {
+						hasTailscaledProcess = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if !hasTailscaledProcess {
 		return fmt.Errorf("tailscaled process not running")
 	}
 
@@ -535,19 +610,36 @@ func (hc *HealthChecker) attemptRecovery() {
 func (hc *HealthChecker) restartTailscale(ctx context.Context) error {
 	klog.Info("Restarting Tailscale connection...")
 
-	// 首先停止
-	cmd := exec.CommandContext(ctx, "tailscale", "down")
-	if err := cmd.Run(); err != nil {
-		klog.Warningf("Failed to stop tailscale: %v", err)
-	}
+	// 在 Pod 环境中，tailscale 命令可能不可用
+	// 使用 Tailscale 客户端 API 来重启连接
+	if hc.tailscaleClient != nil {
+		// 尝试断开连接
+		if err := hc.tailscaleClient.Down(ctx); err != nil {
+			klog.Warningf("Failed to stop tailscale via client: %v", err)
+		}
 
-	// 等待停止完成
-	time.Sleep(2 * time.Second)
+		// 等待停止完成
+		time.Sleep(2 * time.Second)
 
-	// 重新启动
-	cmd = exec.CommandContext(ctx, "tailscale", "up", "--accept-routes")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to restart tailscale: %v", err)
+		// 重新启动连接
+		if err := hc.tailscaleClient.Up(ctx, ""); err != nil {
+			return fmt.Errorf("failed to restart tailscale via client: %v", err)
+		}
+	} else {
+		// 回退到命令行方式（如果可用）
+		cmd := exec.CommandContext(ctx, "tailscale", "down")
+		if err := cmd.Run(); err != nil {
+			klog.Warningf("Failed to stop tailscale: %v", err)
+		}
+
+		// 等待停止完成
+		time.Sleep(2 * time.Second)
+
+		// 重新启动
+		cmd = exec.CommandContext(ctx, "tailscale", "up", "--accept-routes")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to restart tailscale: %v", err)
+		}
 	}
 
 	// 等待连接建立
@@ -573,21 +665,33 @@ func (hc *HealthChecker) restartTailscale(ctx context.Context) error {
 func (hc *HealthChecker) cleanupStaleInterfaces(ctx context.Context) error {
 	klog.Info("Cleaning up stale network interfaces...")
 
-	// 使用更安全的清理脚本
-	script := `
-		set -e
-		# 查找孤立的 veth 接口
-		ip link show type veth | grep -o 'veth[^:@]*' | while read iface; do
-			# 检查对应的容器是否还存在
-			if ! docker ps --format "table {{.ID}}" | grep -q "${iface#veth}" 2>/dev/null; then
-				echo "Deleting stale interface: $iface"
-				ip link delete "$iface" 2>/dev/null || true
-			fi
-		done
-	`
+	// 在 Pod 环境中，使用 netlink 替代 shell 脚本
+	// 查找孤立的 veth 接口
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("failed to list network links: %v", err)
+	}
 
-	cmd := exec.CommandContext(ctx, "sh", "-c", script)
-	return cmd.Run()
+	for _, link := range links {
+		// 只处理 veth 接口
+		if link.Type() == "veth" {
+			linkName := link.Attrs().Name
+
+			// 检查接口是否处于 DOWN 状态
+			if link.Attrs().OperState == netlink.OperDown {
+				klog.Infof("Found down interface: %s", linkName)
+
+				// 尝试删除接口
+				if err := netlink.LinkDel(link); err != nil {
+					klog.Warningf("Failed to delete interface %s: %v", linkName, err)
+				} else {
+					klog.Infof("Successfully deleted stale interface: %s", linkName)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // resyncIPAM 重新同步 IPAM 状态

@@ -61,10 +61,21 @@ func NewIPAMManager(nodeName string, podCIDR *net.IPNet) (*IPAMManager, error) {
 		return nil, fmt.Errorf("failed to create local IP pool: %v", err)
 	}
 
-	// 使用 /var/lib/headcni 作为存储路径
-	storagePath := "/var/lib/headcni"
+	// 在 Pod 环境中，使用更灵活的存储路径
+	// 优先使用环境变量，否则使用默认路径
+	storagePath := os.Getenv("HEADCNI_STORAGE_PATH")
+	if storagePath == "" {
+		storagePath = "/var/lib/headcni"
+	}
+
+	// 确保目录存在
 	if err := os.MkdirAll(storagePath, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create storage directory: %v", err)
+		klog.Warningf("Failed to create storage directory %s: %v", storagePath, err)
+		// 回退到临时目录
+		if tempDir, err := os.MkdirTemp("", "headcni-*"); err == nil {
+			storagePath = tempDir
+			klog.Infof("Using temporary directory: %s", storagePath)
+		}
 	}
 
 	manager := &IPAMManager{

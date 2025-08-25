@@ -21,6 +21,8 @@ go.work
 # bin/  # Commented out to keep existing binaries
 dist/
 build/
+bin/
+vendor/
 
 # IDE and editor files
 .vscode/
