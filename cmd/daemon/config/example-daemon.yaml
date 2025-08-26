@@ -77,6 +77,12 @@ logging:
     maxBackups: 3
     maxAge: "7d"
 
+cniPlugins:
+  - name: "portmap"
+    enabled: true
+    priority: 1
+    config: "{\"type\":\"portmap\",\"capabilities\":{\"portMappings\":true},\"snat\":true}"
+
 security:
   tls:
     enabled: false

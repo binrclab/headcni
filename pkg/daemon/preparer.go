@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/backend/tailscale"
 	"github.com/binrclab/headcni/pkg/cni"
 	"github.com/binrclab/headcni/pkg/constants"
@@ -77,6 +77,7 @@ func (p *Preparer) prepare() error {
 	cniConfigManager := cni.NewCNIConfigManager(
 		constants.DefaultCNIConfigDir,      // CNI 配置目录
 		constants.DefaultHeadCNIConfigFile, // CNI 配置文件名
+		constants.DefaultCNIEnvFile,        // CNI 环境配置文件名
 		logging.NewSimpleLogger(),
 	)
 	if err := p.checkCNIConfig(cniConfigManager); err != nil {
@@ -147,53 +148,6 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 
 	logging.Infof("Current node Pod CIDR from Kubernetes API: %s", currentPodCIDR)
 
-	// 检查配置文件是否已存在
-	exists, err := cniConfigManager.CheckConfigListExists()
-	if err != nil {
-		return fmt.Errorf("failed to check config existence: %w", err)
-	}
-
-	if exists {
-		// 配置文件存在，尝试增量更新
-		logging.Infof("CNI config exists, attempting incremental update")
-
-		// 读取现有配置
-		existingConfig, err := cniConfigManager.ReadConfigList()
-		if err != nil {
-			logging.Warnf("Failed to read existing config, will regenerate: %v", err)
-		} else {
-			// 尝试增量更新配置
-			if updatedConfig, updated := p.updateCNIConfigIncrementally(existingConfig, currentPodCIDR); updated {
-				logging.Infof("CNI config updated incrementally")
-
-				// 类型断言并验证更新后的配置
-				if config, ok := updatedConfig.(*cni.CNIConfigList); ok {
-					if err := cniConfigManager.ValidateConfigList(config); err != nil {
-						logging.Warnf("Updated config validation failed, will regenerate: %v", err)
-					} else {
-						// 写入更新后的配置
-						if err := cniConfigManager.WriteConfigList(config); err != nil {
-							logging.Warnf("Failed to write updated config, will regenerate: %v", err)
-						} else {
-							logging.Infof("Successfully updated CNI config incrementally - podCIDR: %s", currentPodCIDR)
-							return nil
-						}
-					}
-				} else {
-					logging.Warnf("Invalid config type after incremental update, will regenerate")
-				}
-			} else {
-				logging.Infof("No incremental update needed, config is up to date")
-				return nil
-			}
-		}
-	} else {
-		logging.Infof("CNI config does not exist, creating new configuration")
-	}
-
-	// 如果增量更新失败或配置不存在，则生成全新配置
-	logging.Infof("Generating new CNI configuration")
-
 	// 备份其他配置文件
 	if err := cniConfigManager.BackupOtherConfigLists(); err != nil {
 		logging.Warnf("Failed to backup existing configs: %v", err)
@@ -202,7 +156,7 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 	dnsServiceIP, clusterDomain := p.getK8sOrK3sDNSAndClusterDomain()
 
 	// 生成新的 CNI 配置
-	configList, err := cniConfigManager.GenerateConfigList(
+	configList, cniEnv, err := cniConfigManager.GenerateConfigList(
 		currentPodCIDR, // Pod CIDR
 		p.config,
 		dnsServiceIP,
@@ -211,14 +165,8 @@ func (p *Preparer) checkCNIConfig(cniConfigManager *cni.CNIConfigManager) error 
 	if err != nil {
 		return fmt.Errorf("failed to generate config list: %w", err)
 	}
-
-	// 验证配置
-	if err := cniConfigManager.ValidateConfigList(configList); err != nil {
-		return fmt.Errorf("failed to validate config list: %w", err)
-	}
-
 	// 写入配置文件
-	if err := cniConfigManager.WriteConfigList(configList); err != nil {
+	if err := cniConfigManager.WriteConfigListAndEnv(configList, cniEnv); err != nil {
 		return fmt.Errorf("failed to write config list: %w", err)
 	}
 
@@ -327,36 +275,6 @@ func (p *Preparer) IsReady() bool {
 	return p.headscaleClient != nil &&
 		p.tailscaleClient != nil &&
 		p.k8sClient != nil
-}
-
-// updateCNIConfigIncrementally 增量更新 CNI 配置
-func (p *Preparer) updateCNIConfigIncrementally(existingConfig interface{}, currentPodCIDR string) (interface{}, bool) {
-	logging.Debugf("Attempting incremental update for Pod CIDR: %s", currentPodCIDR)
-
-	// 如果 Pod CIDR 为空，无法更新
-	if currentPodCIDR == "" {
-		logging.Debugf("Pod CIDR is empty, cannot update")
-		return existingConfig, false
-	}
-
-	// 尝试类型断言为 CNIConfigList
-	config, ok := existingConfig.(*cni.CNIConfigList)
-	if !ok {
-		logging.Debugf("Existing config is not CNIConfigList type, cannot update incrementally")
-		return existingConfig, false
-	}
-
-	// 使用 CNI 包中的方法进行增量更新
-	updated := config.UpdateIncrementally(currentPodCIDR, p.config.Network.ServiceCIDR, p.config.Network.MTU)
-
-	if updated {
-		logging.Infof("CNI config updated incrementally for Pod CIDR: %s", currentPodCIDR)
-		// 返回深拷贝的配置
-		return config.DeepCopy(), true
-	} else {
-		logging.Debugf("No changes detected, config is up to date")
-		return existingConfig, false
-	}
 }
 
 func (p *Preparer) ReloadConfig() (bool, error) {
@@ -600,6 +518,7 @@ func (p *Preparer) recreateAffectedComponents(changes []string) error {
 		cniConfigManager := cni.NewCNIConfigManager(
 			constants.DefaultCNIConfigDir,
 			constants.DefaultHeadCNIConfigFile,
+			constants.DefaultCNIEnvFile,
 			logging.NewSimpleLogger(),
 		)
 		p.cniConfigManager = cniConfigManager

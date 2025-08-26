@@ -1,46 +1,19 @@
 {
   "cniVersion": "1.0.0",
-  "name": "headcni",
+  "name": "cbr0",
+  "type": "headcni",
   "plugins": [
     {
       "type": "headcni",
-      "ipam": {
-        "type": "host-local", # host-local
-        "dataDir": "/var/lib/headcni/networks/headcni",
-        "ranges": [
-          [
-            {
-              "subnet": "10.42.7.0/24"
-            }
-          ]
-        ],
-        "allocation_strategy": "sequential"
-      },
-      "mtu": 1280,
-      "magic_dns": {
-        "enable": true,
-        "base_domain": "cluster.local",
-        "nameservers": [
-          "10.96.0.10",
-          "10.2.0.1"
-        ],
-        "search_domains": [
-          "cluster.local",
-          "svc.cluster.local",
-          "c.binrc.com"
-        ]
-      },
-      "service_cidr": "10.96.0.0/16",
-      "enable_network_policy": true,
-      "tailscale_nic": "headnic01"
+      "delegate": {
+        "hairpinMode": true,
+        "isDefaultGateway": true
+      }
     },
     {
       "type": "portmap",
       "capabilities": {
         "portMappings": true
-      },
-      "args": {
-        "snat": true
       }
     },
     {
@@ -50,4 +23,4 @@
       }
     }
   ]
-}
+} 

@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/backend/tailscale"
 	"github.com/binrclab/headcni/pkg/constants"
 	"github.com/binrclab/headcni/pkg/headscale"

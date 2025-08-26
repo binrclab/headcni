@@ -1,0 +1,118 @@
+# 构建阶段
+FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+
+# 声明构建参数
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+# 安装构建依赖
+RUN apk add --no-cache git make curl
+
+# 设置 Go 代理为中国镜像
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
+
+# 设置工作目录
+WORKDIR /app
+
+# 复制源代码（包括 .git 目录）
+COPY . .
+
+# 强制更新到指定分支
+RUN git submodule update --init --recursive --remote
+
+# 强制切换到微调分支
+RUN cd tailscale && \
+    git checkout v1.86.4.fine-tuned-version && \
+    echo "=== Current branch: $(git branch --show-current)" && \
+    echo "=== Current commit: $(git rev-parse HEAD)"
+
+# 验证子模块分支和内容
+RUN cd tailscale && git branch -a && git log --oneline -5 && ls -la && ls -la cmd/
+
+# 构建主项目二进制文件（交叉编译）
+RUN echo "Building for platform: $TARGETPLATFORM (OS: $TARGETOS, ARCH: $TARGETARCH)" && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH make build
+
+# 构建子模块中的 Tailscale（交叉编译）
+RUN cd tailscale && \
+    BRANCH_NAME=$(git branch --show-current || git name-rev --name-only HEAD | sed 's/remotes\/origin\///') && \
+    echo "=== Building Tailscale for $TARGETOS/$TARGETARCH from branch: $BRANCH_NAME" && \
+    echo "=== Commit hash: $(git rev-parse HEAD)" && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X tailscale.com/version.shortStamp=$BRANCH_NAME -X tailscale.com/version.longStamp=$BRANCH_NAME -X tailscale.com/version.gitCommitStamp=$(git rev-parse HEAD)" -o /app/bin/tailscale ./cmd/tailscale && \
+    GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X tailscale.com/version.shortStamp=$BRANCH_NAME -X tailscale.com/version.longStamp=$BRANCH_NAME -X tailscale.com/version.gitCommitStamp=$(git rev-parse HEAD)" -o /app/bin/tailscaled ./cmd/tailscaled && \
+    ls -la /app/bin/ && \
+    echo "Tailscale binaries built for $TARGETOS/$TARGETARCH"
+
+# 下载对应架构的 headcni 预编译二进制
+RUN echo "Downloading headcni for $TARGETOS/$TARGETARCH" && \
+    case "$TARGETOS-$TARGETARCH" in \
+        linux-amd64) HEADCNI_ARCH="linux-amd64" ;; \
+        linux-arm64) HEADCNI_ARCH="linux-arm64" ;; \
+        linux-arm) HEADCNI_ARCH="linux-arm" ;; \
+        linux-386) HEADCNI_ARCH="linux-386" ;; \
+        linux-ppc64le) HEADCNI_ARCH="linux-ppc64le" ;; \
+        linux-s390x) HEADCNI_ARCH="linux-s390x" ;; \
+        linux-riscv64) HEADCNI_ARCH="linux-riscv64" ;; \
+        *) echo "Unsupported platform: $TARGETOS-$TARGETARCH"; exit 1 ;; \
+    esac && \
+    wget https://github.com/binrclab/headcni-plugin/releases/download/v1.0.0/headcni-${HEADCNI_ARCH}.tar.gz && \
+    tar -xzf headcni-${HEADCNI_ARCH}.tar.gz -C /app/bin/ && \
+    rm headcni-${HEADCNI_ARCH}.tar.gz && \
+    echo "headcni binaries downloaded for $HEADCNI_ARCH"
+
+# 运行时阶段
+FROM alpine:3.19
+
+# 声明运行时参数
+ARG TARGETPLATFORM
+ARG TARGETOS  
+ARG TARGETARCH
+
+# 添加平台信息标签
+LABEL platform=$TARGETPLATFORM
+LABEL os=$TARGETOS
+LABEL arch=$TARGETARCH
+
+# 安装必要的工具
+RUN apk add --no-cache \
+    iptables \
+    iproute2 \
+    net-tools \
+    curl \
+    ca-certificates \
+    && rm -rf /var/cache/apk/*
+
+# 创建必要的目录
+RUN mkdir -p \
+    /opt/cni/bin \
+    /etc/cni/net.d \
+    /var/lib/headcni \
+    /var/run/headcni \
+    /var/run/headcni/tailscale \
+    /var/lib/headcni/tailscale
+
+# 从构建阶段复制二进制文件
+COPY --from=builder /app/bin/headcni-daemon /opt/cni/bin/
+COPY --from=builder /app/bin/headcni* /opt/cni/bin/
+COPY --from=builder /app/bin/headcni-cli /opt/cni/bin/
+
+# 从构建阶段复制 Tailscale 二进制文件
+COPY --from=builder /app/bin/tailscale /usr/local/bin/
+COPY --from=builder /app/bin/tailscaled /usr/local/bin/
+
+# 设置执行权限
+RUN chmod +x /opt/cni/bin/* /usr/local/bin/tailscale*
+
+# 设置环境变量
+ENV PATH="/opt/cni/bin:$PATH"
+ENV HEADCNI_PLATFORM="$TARGETOS-$TARGETARCH"
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# 默认命令
+CMD ["/opt/cni/bin/headcni-daemon"]

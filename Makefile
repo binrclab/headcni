@@ -23,7 +23,7 @@ EXAMPLES_DIR := examples
 PKG_DIR := pkg
 
 # 二进制文件
-BINARIES := headcni headcni-cli headcni-daemon
+BINARIES := headcni-cli headcni-daemon
 BIN_FILES := $(addprefix $(BIN_DIR)/,$(BINARIES))
 
 # 安装路径
@@ -36,6 +36,16 @@ DATA_DIR := /var/lib/cni/headcni
 
 # 服务名称
 SERVICE_NAME := headcni-daemon
+
+# Docker 相关变量
+DOCKER_IMAGE := headcni-plugin
+DOCKER_REGISTRY := binrclab
+DOCKER_NAMESPACE := headcni-plugin
+DOCKER_TAG := $(VERSION)
+
+# 支持的架构
+SUPPORTED_ARCHS := linux/amd64 linux/arm64 linux/arm/v7 linux/arm/v8
+ARCH_TAGS := amd64 arm64 armv7 armv8
 
 # 默认目标
 .PHONY: all
@@ -53,11 +63,20 @@ help:
 	@echo "  build-daemon   - 构建 headcni-daemon"
 	@echo "  clean          - 清理构建文件"
 	@echo ""
-	@echo "安装目标:"
-	@echo "  install        - 安装核心组件到系统"
-	@echo "  install-cni    - 安装 CNI 插件"
-	@echo "  install-daemon - 安装 headcni-daemon 服务"
-	@echo "  uninstall      - 卸载所有组件"
+	@echo "多架构构建:"
+	@echo "  build-multiarch    - 构建所有架构的二进制文件"
+	@echo "  build-linux-amd64  - 构建 Linux AMD64 二进制文件"
+	@echo "  build-linux-arm64  - 构建 Linux ARM64 二进制文件"
+	@echo "  build-linux-armv7  - 构建 Linux ARMv7 二进制文件"
+	@echo "  build-linux-armv8  - 构建 Linux ARMv8 二进制文件"
+	@echo ""
+	@echo "Docker 多架构构建:"
+	@echo "  docker-multiarch   - 构建所有架构的 Docker 镜像"
+	@echo "  docker-amd64       - 构建 AMD64 Docker 镜像"
+	@echo "  docker-arm64       - 构建 ARM64 Docker 镜像"
+	@echo "  docker-armv7       - 构建 ARMv7 Docker 镜像"
+	@echo "  docker-armv8       - 构建 ARMv8 Docker 镜像"
+	@echo "  docker-push-all    - 推送所有架构镜像到注册表"
 	@echo ""
 	@echo "服务管理:"
 	@echo "  start          - 启动 headcni-daemon 服务"
@@ -113,11 +132,30 @@ $(DIST_DIR):
 build: $(BIN_DIR) $(BIN_FILES)
 	@echo "构建完成: $(BIN_FILES)"
 
+# 多架构二进制文件构建
+.PHONY: build-multiarch
+build-multiarch: build-linux-amd64 build-linux-arm64 build-linux-armv7 build-linux-armv8
+	@echo "✅ 所有架构的二进制文件构建完成"
 
-.PHONY: build-main
-build-main: $(BIN_DIR)
-	@echo "构建主 CNI 插件..."
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni ./cmd/headcni/
+.PHONY: build-linux-amd64
+build-linux-amd64: $(BIN_DIR)
+	@echo "🔨 构建 Linux AMD64 二进制文件..."
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-amd64 ./cmd/headcni-daemon/
+
+.PHONY: build-linux-arm64
+build-linux-arm64: $(BIN_DIR)
+	@echo "🔨 构建 Linux ARM64 二进制文件..."
+	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-arm64 ./cmd/headcni-daemon/
+
+.PHONY: build-linux-armv7
+build-linux-armv7: $(BIN_DIR)
+	@echo "🔨 构建 Linux ARMv7 二进制文件..."
+	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv7 ./cmd/headcni-daemon/
+
+.PHONY: build-linux-armv8
+build-linux-armv8: $(BIN_DIR)
+	@echo "🔨 构建 Linux ARMv8 二进制文件..."
+	GOOS=linux GOARCH=arm GOARM=8 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv8 ./cmd/headcni-daemon/
 
 # 可选组件构建目标
 .PHONY: build-daemon
@@ -144,27 +182,83 @@ clean:
 	rm -rf $(DIST_DIR)
 	$(GO) clean -cache
 
+# Docker 多架构构建目标
+.PHONY: docker-multiarch
+docker-multiarch: create-builder
+	@echo "🔨 构建多架构 Docker 镜像..."
+	docker buildx build \
+		--platform $(SUPPORTED_ARCHS) \
+		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):$(DOCKER_TAG) \
+		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):latest \
+		--file Dockerfile \
+		--push .
+
+.PHONY: create-builder
+create-builder:
+	@echo "📦 创建多架构构建器..."
+	docker buildx create --name multiarch-builder --use --bootstrap || true
+	@echo "✅ 多架构构建器创建完成"
+
+# 本地 Docker 构建（不推送）
+.PHONY: docker-local
+docker-local: create-builder
+	@echo "🔨 构建本地多架构 Docker 镜像..."
+	docker buildx build \
+		--platform $(SUPPORTED_ARCHS) \
+		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):$(DOCKER_TAG) \
+		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):latest \
+		--file Dockerfile \
+		--load .
+
+# 显示 Docker 镜像信息
+.PHONY: docker-info
+docker-info:
+	@echo "📋 Docker 镜像信息："
+	@echo "支持的架构: $(SUPPORTED_ARCHS)"
+	@echo "镜像标签: $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):$(DOCKER_TAG)"
+	@echo "本地镜像:"
+	docker images | grep $(DOCKER_NAMESPACE) || echo "未找到本地镜像"
+
+# 清理 Docker 镜像
+.PHONY: docker-clean-all
+docker-clean-all:
+	@echo "🧹 清理所有架构的 Docker 镜像..."
+	@for arch in $(ARCH_TAGS); do \
+		echo "清理 $$arch 架构镜像..."; \
+		docker rmi $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):$(DOCKER_TAG)-$$arch 2>/dev/null || true; \
+		docker rmi $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):latest-$$arch 2>/dev/null || true; \
+	done
+	@echo "✅ Docker 镜像清理完成"
+
+# 测试多架构镜像
+.PHONY: test-docker-archs
+test-docker-archs:
+	@echo "🧪 测试多架构 Docker 镜像..."
+	@for arch in $(ARCH_TAGS); do \
+		echo "测试 $$arch 架构镜像..."; \
+		docker run --rm -it --platform linux/$$arch $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):latest-$$arch --version || echo "$$arch 架构测试失败"; \
+	done
+	@echo "✅ 多架构镜像测试完成"
+
+# 生成发布包
+.PHONY: package-multiarch
+package-multiarch: build-multiarch $(DIST_DIR)
+	@echo "📦 生成多架构发布包..."
+	@PACKAGE_NAME="$(PROJECT_NAME)-$(VERSION)-multiarch"; \
+	mkdir -p $(DIST_DIR)/$$PACKAGE_NAME; \
+	cp -r $(BIN_DIR)/headcni-linux-* $(DIST_DIR)/$$PACKAGE_NAME/; \
+	cp -r $(EXAMPLES_DIR) $(DIST_DIR)/$$PACKAGE_NAME/ 2>/dev/null || true; \
+	cp -r $(SCRIPTS_DIR) $(DIST_DIR)/$$PACKAGE_NAME/ 2>/dev/null || true; \
+	cp README.md $(DIST_DIR)/$$PACKAGE_NAME/ 2>/dev/null || true; \
+	cp Makefile $(DIST_DIR)/$$PACKAGE_NAME/; \
+	cd $(DIST_DIR) && tar -czf $$PACKAGE_NAME.tar.gz $$PACKAGE_NAME; \
+	rm -rf $(DIST_DIR)/$$PACKAGE_NAME; \
+	echo "✅ 多架构发布包: $(DIST_DIR)/$$PACKAGE_NAME.tar.gz"
+
 # 安装目标
 .PHONY: install
 install: install-cni install-config
 	@echo "安装完成"
-
-.PHONY: install-cni
-install-cni: build
-	@echo "安装 CNI 插件..."
-	sudo mkdir -p $(CNI_BIN_DIR)
-	sudo mkdir -p $(CNI_CONF_DIR)
-	sudo cp $(BIN_DIR)/headcni $(CNI_BIN_DIR)/
-	sudo cp $(BIN_DIR)/headcni-daemon $(CNI_BIN_DIR)/
-	sudo chmod +x $(CNI_BIN_DIR)/headcni
-	sudo chmod +x $(CNI_BIN_DIR)/headcni-daemon
-	@echo "CLI 工具已构建，可以运行: ./bin/headcni-cli --help"
-	@if [ -f $(EXAMPLES_DIR)/cni-config.json ]; then \
-		sudo cp $(EXAMPLES_DIR)/cni-config.json $(CNI_CONF_DIR)/10-headcni.conf; \
-	else \
-		echo "警告: 未找到 CNI 配置文件，请手动创建"; \
-	fi
-	@echo "CNI 插件安装完成"
 
 .PHONY: install-daemon
 install-daemon: build
@@ -381,6 +475,9 @@ debug:
 	@echo "  BIN_DIR: $(BIN_DIR)"
 	@echo "  CNI_BIN_DIR: $(CNI_BIN_DIR)"
 	@echo "  CNI_CONF_DIR: $(CNI_CONF_DIR)"
+	@echo "  DOCKER_IMAGE: $(DOCKER_IMAGE)"
+	@echo "  DOCKER_REGISTRY: $(DOCKER_REGISTRY)"
+	@echo "  SUPPORTED_ARCHS: $(SUPPORTED_ARCHS)"
 
 # 检查依赖
 .PHONY: check-deps
@@ -396,6 +493,11 @@ check-deps:
 		echo "⚠ Tailscale 未安装"; \
 	else \
 		echo "✓ Tailscale 已安装"; \
+	fi
+	@if ! command -v docker > /dev/null; then \
+		echo "⚠ Docker 未安装"; \
+	else \
+		echo "✓ Docker 已安装: $$(docker version)"; \
 	fi
 	@echo "依赖检查完成"
 
@@ -481,11 +583,9 @@ docker-login:
 	fi
 	@echo "认证完成"
 
+# 清理 Docker 镜像（统一使用 docker-clean-all）
 .PHONY: docker-clean
-docker-clean:
-	@echo "清理 Docker 镜像..."
-	docker rmi binrc/headcni:$(VERSION) binrc/headcni:latest 2>/dev/null || true
-	@echo "Docker 镜像清理完成"
+docker-clean: docker-clean-all
 
 # 显示版本信息
 .PHONY: version

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/logging"
 	"github.com/binrclab/headcni/pkg/utils"
 	"github.com/hashicorp/go-retryablehttp"

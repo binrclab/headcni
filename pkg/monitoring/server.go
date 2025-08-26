@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 )
 
 // Server 是监控服务器

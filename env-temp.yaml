@@ -1,0 +1,20 @@
+# HeadCNI Environment Configuration
+# This file replaces the old subnet.env format with a more structured YAML format
+
+# IPv4 network configuration (comma-separated CIDRs)
+network: "10.244.0.0/16,192.168.0.0/16"
+
+# IPv4 subnet configuration
+subnet: "10.244.1.0/24"
+
+# IPv6 network configuration (comma-separated CIDRs)
+ipv6_network: "fd00::/64,2001:db8::/64"
+
+# IPv6 subnet configuration
+ipv6_subnet: "fd00::/80"
+
+# MTU configuration (can be integer or string)
+mtu: 1500
+
+# IP masquerade configuration (can be boolean or string)
+ipmasq: true

@@ -1,7 +1,10 @@
+//go:build !windows
+// +build !windows
+
 package main
 
 import (
-	"github.com/binrclab/headcni/cmd/headcni-daemon/command"
+	"github.com/binrclab/headcni/cmd/daemon/command"
 	"k8s.io/klog/v2"
 )
 

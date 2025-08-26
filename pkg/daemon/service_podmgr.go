@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -371,7 +372,7 @@ func (s *PodMonitoringService) checkCNIConfiguration(podCIDR string) error {
 
 	// 检查 Pod CIDR 是否匹配
 	for _, plugin := range configList.Plugins {
-		if plugin.Type == "headcni" && plugin.PodCIDR == podCIDR {
+		if plugin["type"] == "headcni" && plugin["pod_cidr"] == podCIDR {
 			logging.Debugf("CNI configuration is up to date for Pod CIDR: %s", podCIDR)
 			return nil
 		}
@@ -509,15 +510,22 @@ func (s *PodMonitoringService) updateCNIConfiguration(podCIDR string) error {
 		return fmt.Errorf("configuration not available")
 	}
 
-	// 构建更新参数
-	updates := map[string]interface{}{
-		"pod_cidr":     podCIDR,
-		"service_cidr": config.Network.ServiceCIDR,
-		"mtu":          config.Network.MTU,
+	cniEnv, err := cniConfigManager.ReadCniEnv()
+	if err != nil {
+		return fmt.Errorf("failed to read CNI environment configuration: %v", err)
+	}
+	localCIDR := []string{}
+	if podCIDR != "" {
+		localCIDR = strings.Split(podCIDR, ",")
+	}
+
+	if len(localCIDR) > 0 {
+		cniEnv.Subnet = localCIDR[0]
+		cniEnv.IPv6Sub = localCIDR[1]
 	}
 
 	// 使用 UpdateConfigList 进行局部更新
-	if err := cniConfigManager.UpdateConfigList(updates); err != nil {
+	if err := cniConfigManager.WriteCniEnv(cniEnv); err != nil {
 		return fmt.Errorf("failed to update CNI configuration: %v", err)
 	}
 

@@ -9,7 +9,7 @@ package daemon
 import (
 	"context"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/google/wire"
 )
 

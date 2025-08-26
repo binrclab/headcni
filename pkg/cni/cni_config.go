@@ -1,90 +1,133 @@
 package cni
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"text/template"
+	"time"
 
-	"github.com/binrclab/headcni/cmd/headcni-daemon/config"
+	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/logging"
+	"gopkg.in/yaml.v3"
 )
 
-// CNIConfigList 是 CNI 配置列表结构
-type CNIConfigList struct {
-	CNIVersion   string      `json:"cniVersion"`
-	Name         string      `json:"name"`
-	Plugins      []CNIPlugin `json:"plugins"`
-	DisableCheck bool        `json:"disableCheck,omitempty"`
-}
+// CNI环境配置模板
+const cniEnvTemplate = `# HeadCNI Environment Configuration
+# Generated at: {{.GeneratedAt}}
+# This file replaces the old subnet.env format with a more structured YAML format
+
+{{if .Network}}# IPv4 network configuration ( Service CIDR)
+network: "{{.Network}}"
+{{end}}{{if .Subnet}}# IPv4 subnet configuration
+subnet: "{{.Subnet}}"
+{{end}}{{if .IPv6Net}}# IPv6 network configuration ( Service CIDR)
+ipv6_network: "{{.IPv6Net}}"
+{{end}}{{if .IPv6Sub}}# IPv6 subnet configuration
+ipv6_subnet: "{{.IPv6Sub}}"
+{{end}}{{if .MTU}}# MTU configuration (can be integer or string)
+mtu: {{.MTU}}
+{{end}}{{if .IPMasq}}# IP masquerade configuration (can be boolean or string)
+ipmasq: {{.IPMasq}}
+{{end}}{{if and .DNS .DNS.Nameservers}}# DNS configuration
+dns:
+  nameservers: {{range .DNS.Nameservers}}
+    - {{.}}{{end}}{{if and .DNS.Search .DNS.Search}}  search: {{range .DNS.Search}}
+    - {{.}}{{end}}{{end}}{{if and .DNS.Options .DNS.Options}}  options: {{range .DNS.Options}}
+    - {{.}}{{end}}{{end}}
+{{end}}{{if and .Routes .Routes}}# Routes configuration
+routes: {{range .Routes}}
+  - dst: "{{.Dst}}"{{if .GW}}
+    gw: "{{.GW}}"{{end}}{{end}}
+{{end}}{{if and .Metadata .Metadata.NodeName}}# Metadata
+metadata:
+  generated_at: "{{.Metadata.GeneratedAt}}"{{if .Metadata.NodeName}}  node_name: "{{.Metadata.NodeName}}"{{end}}{{if .Metadata.ClusterCIDR}}  cluster_cidr: "{{.Metadata.ClusterCIDR}}"{{end}}{{if .Metadata.ServiceCIDR}}  service_cidr: "{{.Metadata.ServiceCIDR}}"{{end}}
+{{end}}`
 
 // CNIPlugin 是 CNI 插件配置结构
 type CNIPlugin struct {
-	Type                string                 `json:"type"`
-	Name                string                 `json:"name,omitempty"`
-	CNIVersion          string                 `json:"cniVersion,omitempty"`
-	IPAM                *IPAMConfig            `json:"ipam,omitempty"`
-	Capabilities        map[string]bool        `json:"capabilities,omitempty"`
-	DNS                 *DNSConfig             `json:"dns,omitempty"`
-	MTU                 int                    `json:"mtu,omitempty"`
-	Args                map[string]interface{} `json:"args,omitempty"`
-	MagicDNS            *MagicDNSConfig        `json:"magic_dns,omitempty"`
-	PodCIDR             string                 `json:"pod_cidr,omitempty"`
-	ServiceCIDR         string                 `json:"service_cidr,omitempty"`
-	EnableIPv6          bool                   `json:"enable_ipv6,omitempty"`
-	EnableNetworkPolicy bool                   `json:"enable_network_policy,omitempty"`
-	TailscaleNic        string                 `json:"tailscale_nic,omitempty"`
+	CNIVersion    string                   `json:"cniVersion,omitempty"`
+	Name          string                   `json:"name,omitempty"`
+	Type          string                   `json:"type,omitempty"`
+	Plugins       []map[string]interface{} `json:"plugins,omitempty"`
+	IPAM          map[string]interface{}   `json:"ipam,omitempty"`
+	SubnetFile    string                   `json:"subnetFile,omitempty"`
+	DataDir       string                   `json:"dataDir,omitempty"`
+	Delegate      *Delegate                `json:"delegate,omitempty"`
+	RuntimeConfig map[string]interface{}   `json:"runtimeConfig,omitempty"`
 }
 
-// IPAMConfig 是 IPAM 配置结构
-type IPAMConfig struct {
-	Type               string                `json:"type"`
-	Subnet             string                `json:"subnet,omitempty"`
-	Gateway            string                `json:"gateway,omitempty"`
-	Routes             []Route               `json:"routes,omitempty"`
-	DataDir            string                `json:"dataDir,omitempty"`
-	ResolvConf         string                `json:"resolvConf,omitempty"`
-	Ranges             [][]map[string]string `json:"ranges,omitempty"`
-	AllocationStrategy string                `json:"allocation_strategy,omitempty"`
+type Delegate struct {
+	Type             string `json:"type,omitempty"`
+	Bridge           string `json:"bridge,omitempty"`
+	IsDefaultGateway bool   `json:"isDefaultGateway,omitempty"`
+	IsGateway        bool   `json:"isGateway,omitempty"`
+	HairpinMode      bool   `json:"hairpinMode,omitempty"`
+	ForceAddress     bool   `json:"forceAddress,omitempty"`
+	IsMasq           bool   `json:"isMasq,omitempty"`
+	PromiscMode      bool   `json:"promiscMode,omitempty"`
 }
 
-// Route 是路由配置结构
+type CniEnv struct {
+	NetWork  string    `json:"network,omitempty"`
+	Subnet   string    `json:"subnet,omitempty"`
+	IPv6Net  string    `json:"ipv6_network,omitempty"`
+	IPv6Sub  string    `json:"ipv6_subnet,omitempty"`
+	MTU      int       `json:"mtu,omitempty"`
+	IPMasq   bool      `json:"ipmasq,omitempty"`
+	Metadata *Metadata `json:"metadata,omitempty"`
+	Routes   []Route   `json:"routes,omitempty"`
+	DNS      *DNS      `json:"dns,omitempty"`
+	Policies *Policies `json:"policies,omitempty"`
+}
+
+type Metadata struct {
+	GeneratedAt string `json:"generated_at,omitempty"`
+	NodeName    string `json:"node_name,omitempty"`
+	ClusterCIDR string `json:"cluster_cidr,omitempty"`
+	ServiceCIDR string `json:"service_cidr,omitempty"`
+}
+
 type Route struct {
-	Dst string `json:"dst"`
+	Dst string `json:"dst,omitempty"`
 	GW  string `json:"gw,omitempty"`
 }
 
-// DNSConfig 是 DNS 配置结构
-type DNSConfig struct {
+type DNS struct {
 	Nameservers []string `json:"nameservers,omitempty"`
 	Search      []string `json:"search,omitempty"`
 	Options     []string `json:"options,omitempty"`
 }
 
-// MagicDNSConfig 是 MagicDNS 配置结构
-type MagicDNSConfig struct {
-	Enable        bool     `json:"enable"`
-	BaseDomain    string   `json:"base_domain,omitempty"`
-	Nameservers   []string `json:"nameservers,omitempty"`
-	SearchDomains []string `json:"search_domains,omitempty"`
+type Policies struct {
+	AllowHostAccess     bool `json:"allow_host_access,omitempty"`
+	AllowServiceAccess  bool `json:"allow_service_access,omitempty"`
+	AllowExternalAccess bool `json:"allow_external_access,omitempty"`
 }
 
 // CNIConfigManager 是 CNI 配置管理器
 type CNIConfigManager struct {
 	configDir  string
 	configName string
+	cniEnvFile string
 	backupDir  string
 	logger     logging.Logger
 }
 
 // NewCNIConfigManager 创建新的 CNI 配置管理器
-func NewCNIConfigManager(configDir, configName string, logger logging.Logger) *CNIConfigManager {
+func NewCNIConfigManager(configDir, configName, cniEnvFile string, logger logging.Logger) *CNIConfigManager {
+	if cniEnvFile == "" {
+		cniEnvFile = "/var/lib/headcni/env.yaml"
+	}
 	return &CNIConfigManager{
 		configDir:  configDir,
 		configName: configName,
-		backupDir:  filepath.Join(configDir, "backup"),
+		cniEnvFile: cniEnvFile,
+		backupDir:  configDir,
 		logger:     logger,
 	}
 }
@@ -109,99 +152,160 @@ func (cm *CNIConfigManager) CheckConfigListExists() (bool, error) {
 }
 
 // GenerateConfigList 生成 configlist 配置
-func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Config, dnsServiceIP, clusterDomain string) (*CNIConfigList, error) {
+func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Config, dnsServiceIP, clusterDomain string) (*CNIPlugin, *CniEnv, error) {
+	// ----------------------------cniEnv----------------------------
 	// 创建 IPAM 配置，使用 ranges 格式
-	var ipamConfig *IPAMConfig
-	if cfg.IPAM.Type == "host-local" {
-		ipamConfig = &IPAMConfig{
-			Type: "host-local",
-			Ranges: [][]map[string]string{
-				{
-					{"subnet": localCIDR},
-				},
-			},
-			DataDir:            "/var/lib/headcni/networks/headcni",
-			AllocationStrategy: cfg.IPAM.Strategy,
-		}
-	} else {
-		ipamConfig = &IPAMConfig{
-			Type: "host-local",
-			Ranges: [][]map[string]string{
-				{
-					{"subnet": localCIDR},
-				},
-			},
-			DataDir:            "/var/lib/headcni/networks/headcni",
-			AllocationStrategy: cfg.IPAM.Strategy,
-		}
-	}
+	var cniEnv = &CniEnv{}
 
 	// 映射 MagicDNS 配置（来自全局配置，若未设置则使用合理默认值）
 	// 获取默认 DNS 服务 IP
 	defaultDNSIP := dnsServiceIP
 	defaultClusterDomain := clusterDomain
 
-	magicDNSCfg := &MagicDNSConfig{
-		Enable:        cfg.DNS.MagicDNS.Enabled,
-		BaseDomain:    defaultClusterDomain,
-		Nameservers:   []string{defaultDNSIP},
-		SearchDomains: []string{defaultClusterDomain, fmt.Sprintf("svc.%s", defaultClusterDomain)},
+	if cfg.DNS.MagicDNS.Enabled {
+		cniEnv.DNS = &DNS{
+			Nameservers: []string{defaultDNSIP},
+			Search:      []string{defaultClusterDomain, fmt.Sprintf("svc.%s", defaultClusterDomain)},
+		}
+
+		if len(cfg.DNS.MagicDNS.SearchDomains) > 0 {
+			cniEnv.DNS.Search = append(cniEnv.DNS.Search, cfg.DNS.MagicDNS.SearchDomains...)
+		}
+		if len(cfg.DNS.MagicDNS.Options) > 0 {
+			cniEnv.DNS.Options = cfg.DNS.MagicDNS.Options
+		}
+		if len(cfg.DNS.MagicDNS.Nameservers) > 0 {
+			cniEnv.DNS.Nameservers = append(cniEnv.DNS.Nameservers, cfg.DNS.MagicDNS.Nameservers...)
+		}
 	}
-	if len(cfg.DNS.MagicDNS.Nameservers) > 0 {
-		magicDNSCfg.Nameservers = append(magicDNSCfg.Nameservers, cfg.DNS.MagicDNS.Nameservers...)
+	// 处理 ServiceCIDR 和 LocalCIDR，支持 IPv4 和 IPv6
+	var serviceCIDRs []string
+	var localCIDRs []string
+
+	if cfg.Network.ServiceCIDR != "" {
+		serviceCIDRs = strings.Split(cfg.Network.ServiceCIDR, ",")
 	}
-	if len(cfg.DNS.MagicDNS.SearchDomains) > 0 {
-		magicDNSCfg.SearchDomains = append(magicDNSCfg.SearchDomains, cfg.DNS.MagicDNS.SearchDomains...)
+	if localCIDR != "" {
+		localCIDRs = strings.Split(localCIDR, ",")
 	}
 
-	interfaceName := cfg.Tailscale.InterfaceName
-	if interfaceName == "" {
-		interfaceName = "headcni01"
+	cniEnv.MTU = cfg.Network.MTU
+	cniEnv.NetWork = cfg.Network.ServiceCIDR
+	cniEnv.Subnet = localCIDR
+
+	// 设置 IPv4 和 IPv6 网络信息
+	if len(serviceCIDRs) > 0 {
+		cniEnv.NetWork = serviceCIDRs[0]
+		if len(serviceCIDRs) > 1 {
+			cniEnv.IPv6Net = serviceCIDRs[1]
+		}
 	}
 
-	// 创建 HeadCNI 插件配置
-	headcniPlugin := CNIPlugin{
-		Type:                "headcni",
-		IPAM:                ipamConfig,
-		MTU:                 cfg.Network.MTU,
-		MagicDNS:            magicDNSCfg,
-		ServiceCIDR:         cfg.Network.ServiceCIDR,
-		EnableIPv6:          cfg.Network.EnableIPv6,
-		EnableNetworkPolicy: cfg.Network.EnableNetworkPolicy,
-		TailscaleNic:        interfaceName, // 启用 Tailscale NIC
+	if len(localCIDRs) > 0 {
+		cniEnv.Subnet = localCIDRs[0]
+		if len(localCIDRs) > 1 {
+			cniEnv.IPv6Sub = localCIDRs[1]
+		}
 	}
 
-	// 创建 portmap 插件配置
-	portmapPlugin := CNIPlugin{
-		Type: "portmap",
-		Capabilities: map[string]bool{
-			"portMappings": true,
+	cniEnv.IPMasq = cfg.Network.EnableNetworkPolicy
+
+	// 设置元数据
+	cniEnv.Metadata = &Metadata{
+		GeneratedAt: time.Now().Format(time.RFC3339),
+		NodeName:    os.Getenv("NODE_NAME"), // 使用默认节点名
+		ClusterCIDR: localCIDR,
+		ServiceCIDR: cfg.Network.ServiceCIDR,
+	}
+
+	// 设置路由信息
+	if len(serviceCIDRs) > 0 {
+		cniEnv.Routes = []Route{
+			{Dst: serviceCIDRs[0]},
+		}
+	}
+
+	// ----------------------------cniEnv----------------------------
+
+	// ----------------------------configlist----------------------------
+
+	// 创建 cni 插件配置
+	var cniPlugins []map[string]interface{}
+
+	// 将 headcniPlugin 转换为 map[string]interface{}
+	headcniPluginBytes, err := json.Marshal(CNIPlugin{
+		Type: "headcni",
+		Delegate: &Delegate{
+			HairpinMode:      true,
+			IsDefaultGateway: true,
 		},
-		Args: map[string]interface{}{
-			"snat": true,
-		},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal headcni plugin: %v", err)
 	}
 
-	// 创建 bandwidth 插件配置
-	bandwidthPlugin := CNIPlugin{
-		Type: "bandwidth",
-		Capabilities: map[string]bool{
-			"bandwidth": true,
-		},
+	var headcniPluginMap map[string]interface{}
+	if err := json.Unmarshal(headcniPluginBytes, &headcniPluginMap); err != nil {
+		return nil, nil, fmt.Errorf("failed to unmarshal headcni plugin: %v", err)
+	}
+
+	// 将 headcniPlugin 添加到插件列表
+	cniPlugins = append(cniPlugins, headcniPluginMap)
+
+	// 按优先级排序 CNI 插件
+	type pluginWithPriority struct {
+		plugin   map[string]interface{}
+		priority int
+		name     string
+	}
+
+	var pluginsWithPriority []pluginWithPriority
+
+	// 处理其他 CNI 插件配置
+	for _, plugin := range cfg.CNIPlugins {
+		if !plugin.Enabled {
+			continue
+		}
+		// json加载plugin.Config
+		// 然后解析为map[string]interface{}
+		var pluginConfig map[string]interface{}
+		if err := json.Unmarshal([]byte(plugin.Config), &pluginConfig); err != nil {
+			logging.Warnf("failed to unmarshal plugin config %s -> %s: %v", plugin.Name, plugin.Config, err)
+			continue
+		}
+
+		// 将插件和优先级信息保存到临时结构
+		pluginsWithPriority = append(pluginsWithPriority, pluginWithPriority{
+			plugin:   pluginConfig,
+			priority: plugin.Priority,
+			name:     plugin.Name,
+		})
+	}
+
+	// 按优先级排序（数字越小优先级越高）
+	sort.Slice(pluginsWithPriority, func(i, j int) bool {
+		return pluginsWithPriority[i].priority < pluginsWithPriority[j].priority
+	})
+
+	// 按排序后的顺序添加到插件列表
+	for _, pwp := range pluginsWithPriority {
+		cniPlugins = append(cniPlugins, pwp.plugin)
+		logging.Debugf("Added plugin %s with priority %d", pwp.name, pwp.priority)
 	}
 
 	// 创建完整的配置列表
-	configList := &CNIConfigList{
+	configList := &CNIPlugin{
+		Type:       "headcni",
 		CNIVersion: "1.0.0",
-		Name:       "headcni",
-		Plugins:    []CNIPlugin{headcniPlugin, portmapPlugin, bandwidthPlugin},
+		Name:       "cbr0",
+		Plugins:    cniPlugins,
 	}
 
-	return configList, nil
+	return configList, cniEnv, nil
 }
 
 // WriteConfigList 写入 configlist 到文件
-func (cm *CNIConfigManager) WriteConfigList(configList *CNIConfigList) error {
+func (cm *CNIConfigManager) WriteConfigList(configList *CNIPlugin) error {
 	// 确保配置目录存在
 	if err := os.MkdirAll(cm.configDir, 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %v", err)
@@ -228,8 +332,86 @@ func (cm *CNIConfigManager) WriteConfigList(configList *CNIConfigList) error {
 	return nil
 }
 
+// WriteCniEnv 写入 cniEnv 配置（使用模板）
+func (cm *CNIConfigManager) WriteCniEnv(cniEnv *CniEnv) error {
+	// 确保配置目录存在
+	if err := os.MkdirAll(filepath.Dir(cm.cniEnvFile), 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %v", err)
+	}
+
+	// 不再需要序列化，直接使用模板生成
+
+	// 解析模板
+	tmpl, err := template.New("cniEnv").Parse(cniEnvTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse template: %v", err)
+	}
+
+	// 准备模板数据，确保所有字段都有默认值
+	templateData := map[string]interface{}{
+		"GeneratedAt": time.Now().Format(time.RFC3339),
+		"Network":     getStringOrDefault(cniEnv.NetWork, ""),
+		"Subnet":      getStringOrDefault(cniEnv.Subnet, ""),
+		"MTU":         getIntOrDefault(cniEnv.MTU, 1500),
+		"IPMasq":      getBoolOrDefault(cniEnv.IPMasq, false),
+		"IPv6Net":     getStringOrDefault(cniEnv.IPv6Net, ""),
+		"IPv6Sub":     getStringOrDefault(cniEnv.IPv6Sub, ""),
+		"Metadata":    getMetadataOrDefault(cniEnv.Metadata),
+		"DNS":         getDNSOrDefault(cniEnv.DNS),
+		"Routes":      getRoutesOrDefault(cniEnv.Routes),
+	}
+
+	// 执行模板
+	var buf bytes.Buffer
+	err = tmpl.Execute(&buf, templateData)
+	if err != nil {
+		return fmt.Errorf("failed to execute template: %v", err)
+	}
+
+	// 写入配置文件
+	if err := os.WriteFile(cm.cniEnvFile, buf.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write cniEnv file: %v", err)
+	}
+
+	logging.Infof("Successfully wrote CNI env with template: %s", cm.cniEnvFile)
+	return nil
+}
+
+// WriteConfigListAndEnv 同时写入 CNI 配置和 CNI 环境
+func (cm *CNIConfigManager) WriteConfigListAndEnv(configList *CNIPlugin, cniEnv *CniEnv) error {
+	// 写入 CNI 配置
+	if err := cm.WriteConfigList(configList); err != nil {
+		return fmt.Errorf("failed to write CNI config: %v", err)
+	}
+
+	// 写入 CNI 环境
+	if err := cm.WriteCniEnv(cniEnv); err != nil {
+		return fmt.Errorf("failed to write CNI env: %v", err)
+	}
+
+	logging.Infof("Successfully wrote both CNI config and CNI env")
+	return nil
+}
+
+// ReadCniEnv 读取 cniEnv 配置
+
+func (cm *CNIConfigManager) ReadCniEnv() (*CniEnv, error) {
+	// 读取配置文件
+	cniEnvBytes, err := os.ReadFile(cm.cniEnvFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cniEnv file: %v", err)
+	}
+
+	var cniEnv CniEnv
+	if err := yaml.Unmarshal(cniEnvBytes, &cniEnv); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal cniEnv: %v", err)
+	}
+
+	return &cniEnv, nil
+}
+
 // ReadConfigList 读取 configlist 配置
-func (cm *CNIConfigManager) ReadConfigList() (*CNIConfigList, error) {
+func (cm *CNIConfigManager) ReadConfigList() (*CNIPlugin, error) {
 	configPath := filepath.Join(cm.configDir, cm.configName)
 
 	// 读取配置文件
@@ -239,34 +421,12 @@ func (cm *CNIConfigManager) ReadConfigList() (*CNIConfigList, error) {
 	}
 
 	// 解析配置
-	var configList CNIConfigList
+	var configList CNIPlugin
 	if err := json.Unmarshal(configData, &configList); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %v", err)
 	}
 
 	return &configList, nil
-}
-
-// UpdateConfigList 更新 configlist 配置
-func (cm *CNIConfigManager) UpdateConfigList(updates map[string]interface{}) error {
-	// 读取现有配置
-	configList, err := cm.ReadConfigList()
-	if err != nil {
-		return fmt.Errorf("failed to read existing config: %v", err)
-	}
-
-	// 应用更新
-	if err := cm.applyUpdates(configList, updates); err != nil {
-		return fmt.Errorf("failed to apply updates: %v", err)
-	}
-
-	// 写入更新后的配置
-	if err := cm.WriteConfigList(configList); err != nil {
-		return fmt.Errorf("failed to write updated config: %v", err)
-	}
-
-	logging.Infof("Successfully updated CNI config")
-	return nil
 }
 
 // BackupOtherConfigLists 备份其他的 configlist
@@ -557,152 +717,6 @@ func (cm *CNIConfigManager) cleanupOldBackups(keepCount int) error {
 	return nil
 }
 
-// validateCNIConfigFile 验证 CNI 配置文件的有效性
-func (cm *CNIConfigManager) validateCNIConfigFile(filePath string) error {
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read config file: %v", err)
-	}
-
-	// 尝试解析为 JSON
-	var config interface{}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return fmt.Errorf("invalid JSON format: %v", err)
-	}
-
-	// 检查是否为 CNI 配置列表格式
-	if configMap, ok := config.(map[string]interface{}); ok {
-		// 检查必需字段
-		if _, hasCNIVersion := configMap["cniVersion"]; !hasCNIVersion {
-			return fmt.Errorf("missing required field: cniVersion")
-		}
-		if _, hasName := configMap["name"]; !hasName {
-			return fmt.Errorf("missing required field: name")
-		}
-
-		// 检查是否为配置列表格式
-		if plugins, hasPlugins := configMap["plugins"]; hasPlugins {
-			if pluginList, ok := plugins.([]interface{}); ok {
-				if len(pluginList) == 0 {
-					return fmt.Errorf("plugins array cannot be empty")
-				}
-				// 验证每个插件
-				for i, plugin := range pluginList {
-					if pluginMap, ok := plugin.(map[string]interface{}); ok {
-						if _, hasType := pluginMap["type"]; !hasType {
-							return fmt.Errorf("plugin %d missing required field: type", i)
-						}
-					} else {
-						return fmt.Errorf("plugin %d is not a valid object", i)
-					}
-				}
-			} else {
-				return fmt.Errorf("plugins field must be an array")
-			}
-		} else {
-			// 单个插件配置
-			if _, hasType := configMap["type"]; !hasType {
-				return fmt.Errorf("missing required field: type")
-			}
-		}
-	} else {
-		return fmt.Errorf("config must be a JSON object")
-	}
-
-	return nil
-}
-
-// validateBackupFile 验证备份文件的有效性
-func (cm *CNIConfigManager) validateBackupFile(backupFileName string) error {
-	backupPath := filepath.Join(cm.backupDir, backupFileName)
-
-	// 检查备份文件是否存在
-	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		return fmt.Errorf("backup file does not exist: %s", backupPath)
-	}
-
-	// 验证文件格式
-	return cm.validateCNIConfigFile(backupPath)
-}
-
-// getBackupFileInfo 获取备份文件信息
-func (cm *CNIConfigManager) getBackupFileInfo(backupFileName string) (map[string]interface{}, error) {
-	backupPath := filepath.Join(cm.backupDir, backupFileName)
-
-	data, err := os.ReadFile(backupPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read backup file: %v", err)
-	}
-
-	var config map[string]interface{}
-	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse backup file: %v", err)
-	}
-
-	return config, nil
-}
-
-// applyUpdates 应用配置更新
-func (cm *CNIConfigManager) applyUpdates(configList *CNIConfigList, updates map[string]interface{}) error {
-	for key, value := range updates {
-		switch key {
-		case "cniVersion":
-			if version, ok := value.(string); ok {
-				configList.CNIVersion = version
-			}
-		case "name":
-			if name, ok := value.(string); ok {
-				configList.Name = name
-			}
-		case "disableCheck":
-			if disable, ok := value.(bool); ok {
-				configList.DisableCheck = disable
-			}
-		case "mtu":
-			if mtu, ok := value.(int); ok {
-				for i := range configList.Plugins {
-					configList.Plugins[i].MTU = mtu
-				}
-			}
-		case "subnet":
-			if subnet, ok := value.(string); ok {
-				for i := range configList.Plugins {
-					if configList.Plugins[i].IPAM != nil {
-						configList.Plugins[i].IPAM.Subnet = subnet
-					}
-				}
-			}
-		default:
-			logging.Warnf("Unknown config update key: %s", key)
-		}
-	}
-
-	return nil
-}
-
-// ValidateConfigList 验证 configlist 配置
-func (cm *CNIConfigManager) ValidateConfigList(configList *CNIConfigList) error {
-	if configList.CNIVersion == "" {
-		return fmt.Errorf("cniVersion is required")
-	}
-
-	if configList.Name == "" {
-		return fmt.Errorf("name is required")
-	}
-
-	if len(configList.Plugins) == 0 {
-		return fmt.Errorf("at least one plugin is required")
-	}
-
-	for i, plugin := range configList.Plugins {
-		if plugin.Type == "" {
-			return fmt.Errorf("plugin %d: type is required", i)
-		}
-	}
-
-	return nil
-}
-
 // GetConfigPath 获取配置文件路径
 func (cm *CNIConfigManager) GetConfigPath() string {
 	return filepath.Join(cm.configDir, cm.configName)
@@ -713,148 +727,59 @@ func (cm *CNIConfigManager) GetBackupDir() string {
 	return cm.backupDir
 }
 
-// DeepCopyConfig 深拷贝 CNI 配置
-func (c *CNIConfigList) DeepCopy() *CNIConfigList {
-	if c == nil {
+// 移除深拷贝函数，直接覆盖更简单
+
+// 移除复杂的增量更新函数，直接覆盖更简单
+
+// 辅助函数：安全获取字符串值，空值时返回空字符串（模板中不显示）
+func getStringOrDefault(value, defaultValue string) string {
+	if value == "" {
+		return ""
+	}
+	return value
+}
+
+// 辅助函数：安全获取整数值，0值时返回0（模板中不显示）
+func getIntOrDefault(value, defaultValue int) int {
+	if value == 0 {
+		return 0
+	}
+	return value
+}
+
+// 辅助函数：安全获取布尔值，false值时返回false（模板中不显示）
+func getBoolOrDefault(value, defaultValue bool) bool {
+	return value
+}
+
+// 辅助函数：安全获取Metadata，nil时返回nil（模板中不显示）
+func getMetadataOrDefault(metadata *Metadata) *Metadata {
+	if metadata == nil {
 		return nil
 	}
-
-	// 创建新的配置对象
-	copied := &CNIConfigList{
-		CNIVersion:   c.CNIVersion,
-		Name:         c.Name,
-		DisableCheck: c.DisableCheck,
+	// 如果metadata存在但字段为空，也返回nil
+	if metadata.NodeName == "" && metadata.ClusterCIDR == "" && metadata.ServiceCIDR == "" {
+		return nil
 	}
-
-	// 深拷贝插件配置
-	if c.Plugins != nil {
-		copied.Plugins = make([]CNIPlugin, len(c.Plugins))
-		for i, plugin := range c.Plugins {
-			copied.Plugins[i] = CNIPlugin{
-				Type:                plugin.Type,
-				Name:                plugin.Name,
-				CNIVersion:          plugin.CNIVersion,
-				MTU:                 plugin.MTU,
-				PodCIDR:             plugin.PodCIDR,
-				ServiceCIDR:         plugin.ServiceCIDR,
-				EnableIPv6:          plugin.EnableIPv6,
-				EnableNetworkPolicy: plugin.EnableNetworkPolicy,
-				TailscaleNic:        plugin.TailscaleNic,
-			}
-
-			// 深拷贝 IPAM 配置
-			if plugin.IPAM != nil {
-				copied.Plugins[i].IPAM = &IPAMConfig{
-					Type:               plugin.IPAM.Type,
-					Subnet:             plugin.IPAM.Subnet,
-					Gateway:            plugin.IPAM.Gateway,
-					DataDir:            plugin.IPAM.DataDir,
-					ResolvConf:         plugin.IPAM.ResolvConf,
-					AllocationStrategy: plugin.IPAM.AllocationStrategy,
-				}
-
-				// 深拷贝 IPAM Routes
-				if plugin.IPAM.Routes != nil {
-					copied.Plugins[i].IPAM.Routes = make([]Route, len(plugin.IPAM.Routes))
-					for j, route := range plugin.IPAM.Routes {
-						copied.Plugins[i].IPAM.Routes[j] = Route{
-							Dst: route.Dst,
-							GW:  route.GW,
-						}
-					}
-				}
-
-				// 深拷贝 IPAM Ranges
-				if plugin.IPAM.Ranges != nil {
-					copied.Plugins[i].IPAM.Ranges = make([][]map[string]string, len(plugin.IPAM.Ranges))
-					for j, rangeGroup := range plugin.IPAM.Ranges {
-						copied.Plugins[i].IPAM.Ranges[j] = make([]map[string]string, len(rangeGroup))
-						for k, rangeItem := range rangeGroup {
-							copied.Plugins[i].IPAM.Ranges[j][k] = make(map[string]string)
-							for key, value := range rangeItem {
-								copied.Plugins[i].IPAM.Ranges[j][k][key] = value
-							}
-						}
-					}
-				}
-			}
-
-			// 深拷贝 Capabilities
-			if plugin.Capabilities != nil {
-				copied.Plugins[i].Capabilities = make(map[string]bool)
-				for key, value := range plugin.Capabilities {
-					copied.Plugins[i].Capabilities[key] = value
-				}
-			}
-
-			// 深拷贝 Args
-			if plugin.Args != nil {
-				copied.Plugins[i].Args = make(map[string]interface{})
-				for key, value := range plugin.Args {
-					copied.Plugins[i].Args[key] = value
-				}
-			}
-		}
-	}
-
-	return copied
+	return metadata
 }
 
-// UpdateConfigIncrementally 增量更新 CNI 配置
-func (c *CNIConfigList) UpdateIncrementally(currentPodCIDR, serviceCIDR string, mtu int) bool {
-	if c == nil || currentPodCIDR == "" {
-		return false
+// 辅助函数：安全获取DNS配置，nil时返回nil（模板中不显示）
+func getDNSOrDefault(dns *DNS) *DNS {
+	if dns == nil {
+		return nil
 	}
-
-	updated := false
-
-	// 检查并更新插件配置
-	for i, plugin := range c.Plugins {
-		// 1. 检查并更新 Pod CIDR
-		if plugin.PodCIDR != currentPodCIDR {
-			c.Plugins[i].PodCIDR = currentPodCIDR
-			updated = true
-		}
-
-		// 2. 检查并更新 Service CIDR
-		if plugin.ServiceCIDR != serviceCIDR {
-			c.Plugins[i].ServiceCIDR = serviceCIDR
-			updated = true
-		}
-
-		// 3. 检查并更新 MTU
-		if plugin.MTU != mtu {
-			c.Plugins[i].MTU = mtu
-			updated = true
-		}
-
-		// 4. 检查并更新 IPAM 配置
-		if plugin.IPAM != nil && plugin.IPAM.Subnet != currentPodCIDR {
-			c.Plugins[i].IPAM.Subnet = currentPodCIDR
-			updated = true
-		}
+	// 如果DNS存在但所有字段都为空，也返回nil
+	if len(dns.Nameservers) == 0 && len(dns.Search) == 0 && len(dns.Options) == 0 {
+		return nil
 	}
-
-	return updated
+	return dns
 }
 
-// IsConfigUpToDate 检查配置是否是最新的
-func (c *CNIConfigList) IsUpToDate(currentPodCIDR, serviceCIDR string, mtu int) bool {
-	if c == nil || currentPodCIDR == "" {
-		return false
+// 辅助函数：安全获取路由配置，nil或空时返回nil（模板中不显示）
+func getRoutesOrDefault(routes []Route) []Route {
+	if routes == nil || len(routes) == 0 {
+		return nil
 	}
-
-	for _, plugin := range c.Plugins {
-		if plugin.PodCIDR != currentPodCIDR ||
-			plugin.ServiceCIDR != serviceCIDR ||
-			plugin.MTU != mtu {
-			return false
-		}
-
-		if plugin.IPAM != nil && plugin.IPAM.Subnet != currentPodCIDR {
-			return false
-		}
-	}
-
-	return true
+	return routes
 }

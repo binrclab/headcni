@@ -8,17 +8,18 @@ import (
 
 // Config 表示 HeadCNI 的完整配置
 type Config struct {
-	Daemon      DaemonConfig      `yaml:"daemon"`
-	Headscale   HeadscaleConfig   `yaml:"headscale"`
-	Tailscale   TailscaleConfig   `yaml:"tailscale"`
-	Network     NetworkConfig     `yaml:"network"`
-	IPAM        IPAMConfig        `yaml:"ipam"`
-	DNS         DNSConfig         `yaml:"dns"`
-	Monitoring  MonitoringConfig  `yaml:"monitoring"`
-	Logging     LoggingConfig     `yaml:"logging"`
-	Security    SecurityConfig    `yaml:"security"`
-	Performance PerformanceConfig `yaml:"performance"`
-	ConfigPath  string            `yaml:"configPath"`
+	Daemon      DaemonConfig       `yaml:"daemon"`
+	Headscale   HeadscaleConfig    `yaml:"headscale"`
+	Tailscale   TailscaleConfig    `yaml:"tailscale"`
+	Network     NetworkConfig      `yaml:"network"`
+	IPAM        IPAMConfig         `yaml:"ipam"`
+	DNS         DNSConfig          `yaml:"dns"`
+	Monitoring  MonitoringConfig   `yaml:"monitoring"`
+	Logging     LoggingConfig      `yaml:"logging"`
+	Security    SecurityConfig     `yaml:"security"`
+	Performance PerformanceConfig  `yaml:"performance"`
+	CNIPlugins  []CNIPluginsConfig `yaml:"cniPlugins"`
+	ConfigPath  string             `yaml:"configPath"`
 }
 
 // DaemonConfig 基础配置
@@ -198,6 +199,14 @@ type ConcurrencyConfig struct {
 	QueueSize  int `yaml:"queueSize"`
 }
 
+// CNIPluginsConfig CNI 插件配置
+type CNIPluginsConfig struct {
+	Name     string `yaml:"name"`
+	Enabled  bool   `yaml:"enabled"`
+	Priority int    `yaml:"priority"`
+	Config   string `yaml:"config"`
+}
+
 // LoadDefaultConfig 加载默认配置
 func DefaultConfig() (*Config, error) {
 	// 获取当前可执行文件所在目录
@@ -331,6 +340,14 @@ func DefaultConfig() (*Config, error) {
 			Concurrency: ConcurrencyConfig{
 				MaxWorkers: 10,
 				QueueSize:  100,
+			},
+		},
+		CNIPlugins: []CNIPluginsConfig{
+			{
+				Name:     "portmap",
+				Enabled:  true,
+				Priority: 1,
+				Config:   "{\"type\":\"portmap\",\"capabilities\":{\"portMappings\":true},\"snat\":true}",
 			},
 		},
 	}, nil
