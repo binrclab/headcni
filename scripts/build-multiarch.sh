@@ -11,20 +11,20 @@ NAMESPACE="${NAMESPACE:-binrc}"
 IMAGE_NAME="${IMAGE_NAME:-headcni}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 
-# 支持的平台
+# 支持的平台 (按构建速度排序)
 PLATFORMS=(
-    "linux/amd64"      # 最快
-    "linux/arm64"      # 较快
-    "linux/arm/v7"     # 中等
-    "linux/arm/v8"     # 中等
-    "linux/386"        # 较快
-    "linux/ppc64le"    # 较慢
-    "linux/s390x"      # 较慢
-    "linux/riscv64"    # 最慢
-    # "darwin/amd64"     # 较快
-    # "darwin/arm64"     # 较快
-    # "windows/amd64"    # 中等
-    # "windows/arm64"    # 中等
+    "linux/amd64"      # 最快 (x86_64)
+    "linux/arm64"      # 较快 (ARM64)
+    "linux/386"        # 较快 (x86)
+    "linux/arm/v7"     # 中等 (ARMv7)
+    "linux/arm/v8"     # 中等 (ARMv8)
+    "linux/ppc64le"    # 较慢 (PowerPC)
+    "linux/s390x"      # 较慢 (IBM S390x)
+    "linux/riscv64"    # 最慢 (RISC-V)
+    # "darwin/amd64"     # 较快 (macOS Intel)
+    # "darwin/arm64"     # 较快 (macOS Apple Silicon)
+    # "windows/amd64"    # 中等 (Windows x64)
+    # "windows/arm64"    # 中等 (Windows ARM64)
 )
 
 # 颜色输出
@@ -99,25 +99,60 @@ build_platform() {
     
     log_info "构建平台: $platform -> $image_tag"
     
-    # 先构建到本地，不使用 --push 参数
-    docker buildx build \
+    # 记录构建开始时间
+    local start_time=$(date +%s)
+    
+    # 构建镜像到 buildx 缓存，不使用 --load 避免并发限制
+    if docker buildx build \
         --platform "$platform" \
         --tag "$image_tag" \
         --file .docker/Dockerfile.local \
         --progress=plain \
         --build-arg TARGETOS=$(echo "$platform" | cut -d'/' -f1) \
         --build-arg TARGETARCH=$(echo "$platform" | cut -d'/' -f2) \
-        --load .
-    
-    log_info "平台镜像构建完成: $image_tag"
-    
-    # 返回镜像标签
-    echo "$image_tag"
+        --cache-from type=local,src=/tmp/.buildx-cache \
+        --cache-to type=local,dest=/tmp/.buildx-cache,mode=max \
+        . > "/tmp/headcni_build_${os_arch}.log" 2>&1; then
+        
+        # 计算构建时间
+        local end_time=$(date +%s)
+        local duration=$((end_time - start_time))
+        
+        log_info "✓ 平台镜像构建完成: $image_tag (耗时: ${duration}s)"
+        
+        # 返回镜像标签
+        echo "$image_tag"
+        return 0
+    else
+        log_error "✗ 平台镜像构建失败: $platform"
+        log_error "构建日志: /tmp/headcni_build_${os_arch}.log"
+        return 1
+    fi
 }
 
 # 并行构建多个平台
 build_platforms_parallel() {
-    local max_jobs=1  # 降低并行数，避免 --load 冲突
+    # 动态计算最优并行数
+    local cpu_cores=$(nproc 2>/dev/null || echo 4)
+    local available_memory=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 8192)
+    
+    # 根据系统资源调整并行数
+    local max_jobs=4  # 默认值
+    if [ "$cpu_cores" -ge 32 ] && [ "$available_memory" -ge 32768 ]; then
+        max_jobs=12  # 顶级高性能系统 (64核+)
+    elif [ "$cpu_cores" -ge 16 ] && [ "$available_memory" -ge 16384 ]; then
+        max_jobs=8   # 高性能系统
+    elif [ "$cpu_cores" -ge 8 ] && [ "$available_memory" -ge 8192 ]; then
+        max_jobs=6   # 中等高性能系统
+    elif [ "$cpu_cores" -ge 4 ] && [ "$available_memory" -ge 4096 ]; then
+        max_jobs=4   # 中等性能系统
+    else
+        max_jobs=2   # 低性能系统
+    fi
+    
+    log_info "系统资源: CPU核心=$cpu_cores, 内存=${available_memory}MB"
+    log_info "设置并行构建数: $max_jobs"
+    
     local built_images=()
     
     log_step "开始构建平台镜像..."
@@ -126,21 +161,60 @@ build_platforms_parallel() {
     local temp_dir=$(mktemp -d)
     local result_file="$temp_dir/build_results.txt"
     
-    # 逐个构建平台镜像（避免 --load 冲突）
-    for platform in "${PLATFORMS[@]}"; do
-        log_info "开始构建平台: $platform"
+    # 使用后台作业和作业控制进行并行构建
+    local job_count=0
+    local platform_index=0
+    
+    while [ $platform_index -lt ${#PLATFORMS[@]} ]; do
+        # 检查当前运行的作业数
+        while [ $(jobs -r | wc -l) -ge $max_jobs ]; do
+            sleep 1
+        done
         
-        if image_tag=$(build_platform "$platform"); then
-            echo "$image_tag" >> "$result_file"
-            log_info "成功构建: $image_tag"
-        else
-            log_error "构建失败: $platform"
-            return 1
-        fi
+        # 启动新的构建作业
+        local platform="${PLATFORMS[$platform_index]}"
+        log_info "启动后台构建: $platform (作业 $((job_count + 1)))"
         
-        # 添加短暂延迟
-        sleep 2
+        (
+            if image_tag=$(build_platform "$platform"); then
+                echo "$image_tag" >> "$result_file"
+                log_info "✓ 后台构建完成: $platform -> $image_tag"
+            else
+                log_error "✗ 后台构建失败: $platform"
+                exit 1
+            fi
+        ) &
+        
+        job_count=$((job_count + 1))
+        platform_index=$((platform_index + 1))
+        
+        # 短暂延迟，避免同时启动过多作业
+        sleep 0.5
     done
+    
+    # 等待所有后台作业完成，显示进度
+    log_info "等待所有构建作业完成..."
+    
+    # 显示进度
+    local completed=0
+    local total=${#PLATFORMS[@]}
+    
+    while [ $completed -lt $total ]; do
+        local running=$(jobs -r | wc -l)
+        local completed=$((total - running))
+        log_info "构建进度: $completed/$total 完成, $running 运行中..."
+        sleep 5
+    done
+    
+    wait
+    
+    # 检查是否有作业失败
+    if [ $? -ne 0 ]; then
+        log_error "部分构建作业失败"
+        return 1
+    fi
+    
+    log_info "✓ 所有构建作业完成"
     
     # 读取构建结果
     if [ -f "$result_file" ]; then
@@ -169,6 +243,41 @@ build_platforms_parallel() {
     fi
     
     return 0
+}
+
+# 从 buildx 缓存导出镜像到本地
+export_images_from_cache() {
+    log_step "从 buildx 缓存导出镜像到本地..."
+    
+    if [ ! -f .docker/.built_platforms.txt ]; then
+        log_error "找不到构建结果文件"
+        return 1
+    fi
+    
+    while IFS= read -r image; do
+        if [ -n "$image" ]; then
+            log_info "导出镜像到本地: $image"
+            
+            # 使用 docker buildx imagetools 检查镜像是否存在
+            if docker buildx imagetools inspect "$image" > /dev/null 2>&1; then
+                # 创建临时 Dockerfile 来导出镜像
+                local temp_dockerfile="/tmp/export_${RANDOM}.Dockerfile"
+                echo "FROM $image" > "$temp_dockerfile"
+                
+                # 导出镜像到本地
+                docker buildx build --load -f "$temp_dockerfile" -t "$image" . > /dev/null 2>&1
+                
+                # 清理临时文件
+                rm -f "$temp_dockerfile"
+                
+                log_info "✓ 镜像导出完成: $image"
+            else
+                log_error "✗ 镜像不存在于 buildx 缓存: $image"
+            fi
+        fi
+    done < .docker/.built_platforms.txt
+    
+    log_info "所有镜像导出完成"
 }
 
 # 推送平台镜像到远程仓库
@@ -322,6 +431,7 @@ main() {
             check_dependencies
             setup_local_builder
             build_platforms_parallel
+            export_images_from_cache
             log_info "✓ 平台镜像构建完成"
             ;;
         "push")
