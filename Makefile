@@ -12,7 +12,7 @@ GO := go
 GOOS := $(shell go env GOOS)
 GOARCH := $(shell go env GOARCH)
 BUILD_DATE := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
-GOFLAGS := -ldflags "-X github.com/binrclab/headcni/cmd/headcni-daemon/command.Version=$(VERSION) -X github.com/binrclab/headcni/cmd/headcni-daemon/command.BuildDate=$(BUILD_DATE) -X github.com/binrclab/headcni/cmd/headcni-daemon/command.GitCommit=$(GIT_COMMIT) -s -w"
+GOFLAGS := -ldflags "-X github.com/binrclab/headcni/cmd/daemon/command.Version=$(VERSION) -X github.com/binrclab/headcni/cmd/daemon/command.BuildDate=$(BUILD_DATE) -X github.com/binrclab/headcni/cmd/daemon/command.GitCommit=$(GIT_COMMIT) -s -w"
 
 # 目录定义
 BIN_DIR := bin
@@ -140,28 +140,28 @@ build-multiarch: build-linux-amd64 build-linux-arm64 build-linux-armv7 build-lin
 .PHONY: build-linux-amd64
 build-linux-amd64: $(BIN_DIR)
 	@echo "🔨 构建 Linux AMD64 二进制文件..."
-	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-amd64 ./cmd/headcni-daemon/
+	GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-amd64 ./cmd/daemon/
 
 .PHONY: build-linux-arm64
 build-linux-arm64: $(BIN_DIR)
 	@echo "🔨 构建 Linux ARM64 二进制文件..."
-	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-arm64 ./cmd/headcni-daemon/
+	GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-arm64 ./cmd/daemon/
 
 .PHONY: build-linux-armv7
 build-linux-armv7: $(BIN_DIR)
 	@echo "🔨 构建 Linux ARMv7 二进制文件..."
-	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv7 ./cmd/headcni-daemon/
+	GOOS=linux GOARCH=arm GOARM=7 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv7 ./cmd/daemon/
 
 .PHONY: build-linux-armv8
 build-linux-armv8: $(BIN_DIR)
 	@echo "🔨 构建 Linux ARMv8 二进制文件..."
-	GOOS=linux GOARCH=arm GOARM=8 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv8 ./cmd/headcni-daemon/
+	GOOS=linux GOARCH=arm GOARM=8 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-linux-armv8 ./cmd/daemon/
 
 # 可选组件构建目标
 .PHONY: build-daemon
 build-daemon: $(BIN_DIR)
-	@echo "构建 headcni-daemon..."
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-daemon ./cmd/headcni-daemon/
+	@echo "构建 daemon..."
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/headcni-daemon ./cmd/daemon/
 
 .PHONY: build-cli
 build-cli: $(BIN_DIR)
@@ -184,14 +184,10 @@ clean:
 
 # Docker 多架构构建目标
 .PHONY: docker-multiarch
-docker-multiarch: create-builder
-	@echo "🔨 构建多架构 Docker 镜像..."
-	docker buildx build \
-		--platform $(SUPPORTED_ARCHS) \
-		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):$(DOCKER_TAG) \
-		--tag $(DOCKER_REGISTRY)/$(DOCKER_NAMESPACE):latest \
-		--file Dockerfile \
-		--push .
+docker-multiarch:
+	@echo -e "$(BLUE)[DOCKER]$(NC) 构建多架构 Docker 镜像..."
+	chmod +x ./scripts/build-multiarch.sh; \
+	./scripts/build-multiarch.sh all; 
 
 .PHONY: create-builder
 create-builder:
@@ -535,7 +531,7 @@ clean-all: clean
 .PHONY: docker
 docker: 
 	@echo "构建 Docker 镜像..."
-	docker build -t binrc/headcni:$(VERSION) .
+	docker build -f .docker/Dockerfile.local -t binrc/headcni:$(VERSION) .
 	docker tag binrc/headcni:$(VERSION) binrc/headcni:latest
 	@echo "Docker 镜像构建完成: binrc/headcni:$(VERSION), binrc/headcni:latest"
 

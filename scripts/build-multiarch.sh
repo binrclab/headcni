@@ -1,222 +1,356 @@
 #!/bin/bash
 
+# HeadCNI Plugin 多平台构建脚本（修复版）
+# 解决镜像标记和 manifest 创建问题
+
 set -e
 
-# 颜色定义
+# 配置
+REGISTRY="${REGISTRY:-docker.io}"
+NAMESPACE="${NAMESPACE:-binrc}"
+IMAGE_NAME="${IMAGE_NAME:-headcni}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+
+# 支持的平台
+PLATFORMS=(
+    "linux/amd64"      # 最快
+    "linux/arm64"      # 较快
+    "linux/arm/v7"     # 中等
+    "linux/arm/v8"     # 中等
+    "linux/386"        # 较快
+    "linux/ppc64le"    # 较慢
+    "linux/s390x"      # 较慢
+    "linux/riscv64"    # 最慢
+    # "darwin/amd64"     # 较快
+    # "darwin/arm64"     # 较快
+    # "windows/amd64"    # 中等
+    # "windows/arm64"    # 中等
+)
+
+# 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# 项目信息
-PROJECT_NAME="headcni"
-VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
-REGISTRY="binrclab"
-
-# 支持的架构
-ARCHITECTURES=("amd64" "arm64")
-
-# 支持的基础镜像
-BASE_IMAGES=(
-    "alpine:3.19"
-    "ubuntu:22.04"
-    "centos:8"
-    "fedora:38"
-)
-
-# 显示帮助信息
-show_help() {
-    echo "HeadCNI 多架构构建脚本"
-    echo "========================"
-    echo ""
-    echo "用法: $0 [选项]"
-    echo ""
-    echo "选项:"
-    echo "  -a, --arch <arch>     指定架构 (amd64, arm64, all)"
-    echo "  -b, --base <image>    指定基础镜像"
-    echo "  -p, --push            推送到镜像仓库"
-    echo "  -h, --help            显示此帮助信息"
-    echo ""
-    echo "示例:"
-    echo "  $0                      # 构建所有架构和基础镜像"
-    echo "  $0 -a amd64            # 只构建 AMD64 架构"
-    echo "  $0 -b alpine:3.19      # 只构建 Alpine 基础镜像"
-    echo "  $0 -a amd64 -b alpine  # 构建 Alpine AMD64 版本"
-    echo "  $0 -p                  # 构建并推送所有镜像"
-    echo ""
+log_info() {
+    echo -e "${GREEN}[INFO]${NC} $1" >&2
 }
 
-# 解析命令行参数
-ARCH="all"
-BASE_IMAGE=""
-PUSH=false
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -a|--arch)
-            ARCH="$2"
-            shift 2
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+log_step() {
+    echo -e "${BLUE}[STEP]${NC} $1" >&2
+}
+
+# 检查依赖
+check_dependencies() {
+    log_step "检查依赖..."
+    
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker 未安装"
+        exit 1
+    fi
+    
+    if ! command -v docker buildx &> /dev/null; then
+        log_error "Docker Buildx 未安装"
+        exit 1
+    fi
+    
+    log_info "依赖检查通过"
+}
+
+# 设置多架构构建器
+setup_local_builder() {
+    log_step "设置多架构构建器..."
+
+    # 确保 QEMU 已安装，支持跨架构构建
+    if ! docker run --privileged --rm tonistiigi/binfmt --install all >/dev/null 2>&1; then
+        log_error "安装 QEMU (binfmt) 失败"
+        exit 1
+    fi
+    log_info "QEMU 已安装，支持跨架构构建"
+
+    # 检查是否已有 multi-builder
+    if docker buildx ls | grep -q "multi-builder"; then
+        log_info "使用已有的 multi-builder"
+        docker buildx use multi-builder
+    else
+        log_info "创建新的 multi-builder"
+        docker buildx create --name multi-builder --driver docker-container --use
+    fi
+
+    # 检查构建器状态
+    docker buildx inspect --bootstrap
+}
+
+# 构建单个平台镜像
+build_platform() {
+    local platform=$1
+    local os_arch=$(echo "$platform" | sed 's/\//-/g')
+    local image_tag="${NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}-${os_arch}"
+    
+    log_info "构建平台: $platform -> $image_tag"
+    
+    # 先构建到本地，不使用 --push 参数
+    docker buildx build \
+        --platform "$platform" \
+        --tag "$image_tag" \
+        --file .docker/Dockerfile.local \
+        --progress=plain \
+        --build-arg TARGETOS=$(echo "$platform" | cut -d'/' -f1) \
+        --build-arg TARGETARCH=$(echo "$platform" | cut -d'/' -f2) \
+        --load .
+    
+    log_info "平台镜像构建完成: $image_tag"
+    
+    # 返回镜像标签
+    echo "$image_tag"
+}
+
+# 并行构建多个平台
+build_platforms_parallel() {
+    local max_jobs=1  # 降低并行数，避免 --load 冲突
+    local built_images=()
+    
+    log_step "开始构建平台镜像..."
+    
+    # 创建临时目录存储结果
+    local temp_dir=$(mktemp -d)
+    local result_file="$temp_dir/build_results.txt"
+    
+    # 逐个构建平台镜像（避免 --load 冲突）
+    for platform in "${PLATFORMS[@]}"; do
+        log_info "开始构建平台: $platform"
+        
+        if image_tag=$(build_platform "$platform"); then
+            echo "$image_tag" >> "$result_file"
+            log_info "成功构建: $image_tag"
+        else
+            log_error "构建失败: $platform"
+            return 1
+        fi
+        
+        # 添加短暂延迟
+        sleep 2
+    done
+    
+    # 读取构建结果
+    if [ -f "$result_file" ]; then
+        while IFS= read -r image; do
+            if [ -n "$image" ]; then
+                built_images+=("$image")
+            fi
+        done < "$result_file"
+    fi
+    
+    # 清理临时目录
+    rm -rf "$temp_dir"
+    
+    log_info "所有平台镜像构建完成，共 ${#built_images[@]} 个镜像"
+    
+    # 保存镜像标签到文件
+    if [ ${#built_images[@]} -gt 0 ]; then
+        printf "%s\n" "${built_images[@]}" > .docker/.built_platforms.txt
+        log_info "保存的镜像标签:"
+        for img in "${built_images[@]}"; do
+            log_info "  - $img"
+        done
+    else
+        log_error "没有成功构建的镜像"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 推送平台镜像到远程仓库
+push_platform_images() {
+    log_step "推送平台镜像到远程仓库..."
+    
+    if [ ! -f .docker/.built_platforms.txt ]; then
+        log_error "找不到构建结果文件"
+        return 1
+    fi
+    
+    while IFS= read -r image; do
+        if [ -n "$image" ]; then
+            log_info "推送镜像: $image"
+            docker push "$image"
+        fi
+    done < .docker/.built_platforms.txt
+    
+    log_info "所有平台镜像推送完成"
+}
+
+# 创建多平台 manifest
+create_manifest() {
+    local skip_push="${SKIP_PUSH:-false}"  # 默认推送 manifest
+    log_step "创建多平台 manifest..."
+    
+    local manifest_tag="${NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+    
+    log_info "创建统一 manifest: $manifest_tag"
+    
+    # 收集所有平台镜像
+    local platform_images=()
+    if [ ! -f .docker/.built_platforms.txt ]; then
+        log_error "找不到构建结果文件"
+        return 1
+    fi
+    
+    while IFS= read -r image; do
+        if [ -n "$image" ]; then
+            platform_images+=("$image")
+            log_info "添加平台镜像: $image"
+        fi
+    done < .docker/.built_platforms.txt
+    
+    # 检查是否有镜像
+    if [ ${#platform_images[@]} -eq 0 ]; then
+        log_error "没有找到平台镜像，无法创建 manifest"
+        return 1
+    fi
+    
+    log_info "准备创建 manifest，包含 ${#platform_images[@]} 个平台镜像"
+    
+    # 验证本地镜像存在
+    for img in "${platform_images[@]}"; do
+        if ! docker image inspect "$img" > /dev/null 2>&1; then
+            log_error "本地镜像不存在: $img"
+            return 1
+        fi
+        log_info "验证本地镜像存在: $img"
+    done
+    
+    # 先推送所有平台镜像到远程仓库
+    push_platform_images
+    
+    # 删除已存在的 manifest（如果有）
+    docker manifest rm "$manifest_tag" 2>/dev/null || true
+    
+    # 创建新的 manifest
+    log_info "创建 manifest: $manifest_tag"
+    docker manifest create "$manifest_tag" "${platform_images[@]}"
+    
+    # 根据设置决定是否推送manifest
+    if [ "$skip_push" = "true" ]; then
+        log_info "跳过manifest推送"
+        log_info "如需推送manifest，请设置 SKIP_PUSH=false"
+    else
+        log_info "推送 manifest 到远程仓库..."
+        docker manifest push "$manifest_tag"
+    fi
+    
+    log_info "✓ 多平台 manifest 创建完成: $manifest_tag"
+    
+    # 保存 manifest 标签到文件
+    echo "$manifest_tag" > .docker/.manifest_tag.txt
+    
+    return 0
+}
+
+# 验证镜像
+verify_images() {
+    log_step "验证构建的镜像..."
+    
+    local manifest_tag="${NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}"
+    
+    # 检查本地平台镜像
+    log_info "检查本地平台镜像..."
+    while IFS= read -r image; do
+        if [ -n "$image" ]; then
+            if docker image inspect "$image" > /dev/null 2>&1; then
+                log_info "✓ 本地镜像存在: $image"
+            else
+                log_error "✗ 本地镜像不存在: $image"
+            fi
+        fi
+    done < .docker/.built_platforms.txt
+    
+    # 检查 manifest
+    log_info "检查 manifest..."
+    if docker manifest inspect "$manifest_tag" > /dev/null 2>&1; then
+        log_info "✓ Manifest 验证通过: $manifest_tag"
+        
+        # 显示支持的平台
+        docker manifest inspect "$manifest_tag" | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture)"' 2>/dev/null | while read platform; do
+            log_info "  支持平台: $platform"
+        done
+    else
+        log_warn "✗ Manifest 验证失败或不存在: $manifest_tag"
+    fi
+    
+    return 0
+}
+
+# 清理临时文件
+cleanup() {
+    log_step "清理临时文件..."
+    
+    rm -f .docker/.built_platforms.txt
+    rm -f .docker/.manifest_tag.txt
+    rm -f /tmp/headcni_build_*.txt 2>/dev/null || true
+    
+    log_info "✓ 清理完成"
+}
+
+# 主函数
+main() {
+    local action="${1:-all}"
+    
+    case "$action" in
+        "all")
+            log_step "开始完整的多架构构建流程..."
+            check_dependencies
+            setup_local_builder
+            build_platforms_parallel
+            create_manifest
+            verify_images
+            cleanup
+            log_info "✓ 多架构构建流程完成"
             ;;
-        -b|--base)
-            BASE_IMAGE="$2"
-            shift 2
+        "build")
+            log_step "开始构建平台镜像..."
+            check_dependencies
+            setup_local_builder
+            build_platforms_parallel
+            log_info "✓ 平台镜像构建完成"
             ;;
-        -p|--push)
-            PUSH=true
-            shift
+        "push")
+            log_step "推送平台镜像..."
+            push_platform_images
+            log_info "✓ 平台镜像推送完成"
             ;;
-        -h|--help)
-            show_help
-            exit 0
+        "manifest")
+            log_step "创建多平台 manifest..."
+            create_manifest
+            log_info "✓ Manifest 创建完成"
+            ;;
+        "verify")
+            log_step "验证镜像..."
+            verify_images
+            log_info "✓ 镜像验证完成"
+            ;;
+        "cleanup")
+            log_step "清理..."
+            cleanup
+            log_info "✓ 清理完成"
             ;;
         *)
-            echo "未知选项: $1"
-            show_help
+            log_error "未知操作: $action"
+            echo "用法: $0 [all|build|push|manifest|verify|cleanup]"
             exit 1
             ;;
     esac
-done
-
-# 验证架构参数
-if [[ "$ARCH" != "all" && "$ARCH" != "amd64" && "$ARCH" != "arm64" ]]; then
-    echo -e "${RED}错误: 不支持的架构 '$ARCH'${NC}"
-    exit 1
-fi
-
-# 验证基础镜像参数
-if [[ -n "$BASE_IMAGE" ]]; then
-    valid_base=false
-    for img in "${BASE_IMAGES[@]}"; do
-        if [[ "$img" == "$BASE_IMAGE" ]]; then
-            valid_base=true
-            break
-        fi
-    done
-    if [[ "$valid_base" == "false" ]]; then
-        echo -e "${RED}错误: 不支持的基础镜像 '$BASE_IMAGE'${NC}"
-        echo "支持的基础镜像: ${BASE_IMAGES[*]}"
-        exit 1
-    fi
-fi
-
-# 设置要构建的架构列表
-if [[ "$ARCH" == "all" ]]; then
-    BUILD_ARCHS=("${ARCHITECTURES[@]}")
-else
-    BUILD_ARCHS=("$ARCH")
-fi
-
-# 设置要构建的基础镜像列表
-if [[ -n "$BASE_IMAGE" ]]; then
-    BUILD_BASES=("$BASE_IMAGE")
-else
-    BUILD_BASES=("${BASE_IMAGES[@]}")
-fi
-
-# 创建多架构构建器
-setup_builder() {
-    echo -e "${BLUE}设置多架构构建器...${NC}"
-    
-    # 检查是否已存在构建器
-    if ! docker buildx inspect multiarch-builder >/dev/null 2>&1; then
-        echo "创建新的多架构构建器..."
-        docker buildx create --name multiarch-builder --use --bootstrap
-    else
-        echo "使用现有的多架构构建器..."
-        docker buildx use multiarch-builder
-    fi
-    
-    echo -e "${GREEN}多架构构建器设置完成${NC}"
 }
 
-# 构建单个镜像
-build_image() {
-    local base_image="$1"
-    local arch="$2"
-    
-    # 从基础镜像名称提取发行版名称
-    local distro=$(echo "$base_image" | cut -d: -f1)
-    local tag=$(echo "$base_image" | cut -d: -f2)
-    
-    # 构建镜像标签
-    local image_tag="${REGISTRY}/${PROJECT_NAME}:${VERSION}-${distro}-${arch}"
-    local latest_tag="${REGISTRY}/${PROJECT_NAME}:latest-${distro}-${arch}"
-    
-    echo -e "${BLUE}构建镜像: ${image_tag}${NC}"
-    echo "基础镜像: $base_image"
-    echo "架构: $arch"
-    
-    # 构建镜像
-    docker buildx build \
-        --platform "linux/$arch" \
-        --build-arg "BASE_IMAGE=$base_image" \
-        --tag "$image_tag" \
-        --tag "$latest_tag" \
-        --file Dockerfile \
-        --load \
-        .
-    
-    if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}✅ 镜像构建成功: ${image_tag}${NC}"
-        
-        # 如果需要推送
-        if [[ "$PUSH" == "true" ]]; then
-            echo -e "${YELLOW}推送镜像到仓库...${NC}"
-            docker push "$image_tag"
-            docker push "$latest_tag"
-            echo -e "${GREEN}✅ 镜像推送成功${NC}"
-        fi
-    else
-        echo -e "${RED}❌ 镜像构建失败: ${image_tag}${NC}"
-        return 1
-    fi
-}
-
-# 主构建流程
-main() {
-    echo -e "${BLUE}开始构建 HeadCNI 多架构镜像${NC}"
-    echo "版本: $VERSION"
-    echo "架构: ${BUILD_ARCHS[*]}"
-    echo "基础镜像: ${BUILD_BASES[*]}"
-    echo "推送: $PUSH"
-    echo ""
-    
-    # 设置构建器
-    setup_builder
-    
-    # 构建所有组合
-    local success_count=0
-    local total_count=0
-    
-    for base_image in "${BUILD_BASES[@]}"; do
-        for arch in "${BUILD_ARCHS[@]}"; do
-            total_count=$((total_count + 1))
-            echo ""
-            echo "=========================================="
-            echo "构建进度: $total_count / $(( ${#BUILD_BASES[@]} * ${#BUILD_ARCHS[@]} ))"
-            echo "=========================================="
-            
-            if build_image "$base_image" "$arch"; then
-                success_count=$((success_count + 1))
-            fi
-        done
-    done
-    
-    echo ""
-    echo "=========================================="
-    echo "构建完成"
-    echo "=========================================="
-    echo "成功: $success_count / $total_count"
-    
-    if [[ $success_count -eq $total_count ]]; then
-        echo -e "${GREEN}🎉 所有镜像构建成功!${NC}"
-        exit 0
-    else
-        echo -e "${RED}❌ 部分镜像构建失败${NC}"
-        exit 1
-    fi
-}
-
-# 运行主函数
-main "$@" 
+# 执行主函数
+main "$@"

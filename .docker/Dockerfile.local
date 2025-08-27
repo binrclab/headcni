@@ -1,15 +1,16 @@
 # Build Stage - 使用目标架构的基础镜像
-FROM --platform=linux/amd64 golang:1.24-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Declare build arguments
-ARG TARGETOS
-ARG TARGETARCH
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 ARG GOPROXY=https://goproxy.cn,direct
 ARG GOSUMDB=sum.golang.google.cn
 
 # 使用国内 Alpine 镜像源并安装构建依赖（包括gcc）
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
     apk update && \
+    mkdir -p /app/cmd/ && \
     apk add --no-cache --virtual .build-deps \
         git \
         make \
@@ -31,7 +32,7 @@ WORKDIR /app
 COPY . .
 
 # 强制更新到指定分支
-RUN git submodule update --init --recursive --remote
+# RUN git submodule update --init --recursive --remote
 
 # 强制切换到微调分支
 RUN cd tailscale && \
@@ -60,9 +61,9 @@ RUN cd tailscale && \
 FROM alpine:3.20
 
 # 声明运行时参数
-ARG TARGETPLATFORM
-ARG TARGETOS  
-ARG TARGETARCH
+ARG TARGETPLATFORM=linux/amd64
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
 
 # 添加平台信息标签
 LABEL platform=$TARGETPLATFORM

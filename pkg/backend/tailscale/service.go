@@ -407,7 +407,7 @@ func (s *Service) startTailscaledProcess() error {
 		"--tun", fmt.Sprintf("%s", s.Name),
 		"--port", "41645",
 		"--verbose", "1",
-		"--statedir", s.ConfigDir,
+		"--statedir", filepath.Dir(s.StateFile),
 	)
 
 	// 捕获输出用于调试

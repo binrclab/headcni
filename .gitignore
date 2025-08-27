@@ -126,6 +126,8 @@ kubeconfig
 
 # Docker
 .dockerignore
+.docker/.built_platforms.txt
+.docker/.manifest_tag.txt
 
 # Helm
 charts/*.tgz

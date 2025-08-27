@@ -179,13 +179,8 @@ func (tsm *TailscaleService) initTailscaleEnv(node *coreV1.Node) *TailscaleEnv {
 		return tailscaleEnv
 	} else {
 		// 验证 daemon 模式的路径
-		configDir := filepath.Dir(tsm.preparer.GetConfig().Tailscale.Socket.Path)
-		if configDir == "" || configDir == "." {
-			logging.Warnf("Invalid config directory path derived from socket path: %s", tsm.preparer.GetConfig().Tailscale.Socket.Path)
-			configDir = "/var/run/headcni" // 使用默认路径作为后备
-		}
-
-		hostnamePath := filepath.Join(configDir, "hostname")
+		stateDir := constants.DefaultTailscaleDaemonStateDir
+		hostnamePath := filepath.Join(stateDir, "hostname")
 
 		// 在 daemon 模式下，确保使用独特的接口名称
 		interfaceName := tsm.preparer.GetConfig().Tailscale.InterfaceName
@@ -193,18 +188,19 @@ func (tsm *TailscaleService) initTailscaleEnv(node *coreV1.Node) *TailscaleEnv {
 			// 使用默认的 headcni01 接口名称
 			interfaceName = "headcni01"
 		}
+		configDir := filepath.Dir(tsm.preparer.GetConfig().Tailscale.Socket.Path)
 
 		tailscaleEnv := &TailscaleEnv{
 			isDaemon:     !isHost,
 			configDir:    configDir,
 			socketPath:   tsm.preparer.GetConfig().Tailscale.Socket.Path,
-			statePath:    filepath.Join(configDir, "tailscaled.state"),
+			statePath:    constants.DefaultTailscaleDaemonStateFile,
 			pidPath:      filepath.Join(configDir, "tailscaled.pid"),
 			hostNamePath: hostnamePath,
 			hostName:     tsm.readHostNameInDomain(hostnamePath),
 			tailscaleNic: interfaceName,
 		}
-		logging.Infof("Initialized daemon mode environment - ConfigDir: %s, SocketPath: %s, Interface: %s", configDir, tsm.preparer.GetConfig().Tailscale.Socket.Path, interfaceName)
+		logging.Infof("Initialized daemon mode environment - ConfigDir: %s, StateDir: %s, SocketPath: %s, Interface: %s", configDir, stateDir, tsm.preparer.GetConfig().Tailscale.Socket.Path, interfaceName)
 		return tailscaleEnv
 	}
 }
