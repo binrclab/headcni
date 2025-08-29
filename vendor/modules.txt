@@ -127,6 +127,9 @@ github.com/aws/smithy-go/waiter
 # github.com/beorn7/perks v1.0.1
 ## explicit; go 1.11
 github.com/beorn7/perks/quantile
+# github.com/binrclab/yamlc v0.0.0-20250828075026-fd528e911416
+## explicit; go 1.19
+github.com/binrclab/yamlc
 # github.com/cespare/xxhash/v2 v2.3.0
 ## explicit; go 1.11
 github.com/cespare/xxhash/v2
@@ -141,9 +144,6 @@ github.com/coder/websocket/internal/xsync
 # github.com/containerd/console v1.0.5
 ## explicit; go 1.13
 github.com/containerd/console
-# github.com/containernetworking/cni v1.3.0
-## explicit; go 1.21
-github.com/containernetworking/cni/pkg/types
 # github.com/containernetworking/plugins v1.7.1
 ## explicit; go 1.23.0
 github.com/containernetworking/plugins/pkg/ns

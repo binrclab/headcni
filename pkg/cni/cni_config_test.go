@@ -2,10 +2,15 @@ package cni
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+
+	"os"
+	"path/filepath"
 
 	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/logging"
+	"github.com/binrclab/yamlc"
 )
 
 func TestGenerateConfigList(t *testing.T) {
@@ -162,4 +167,202 @@ func TestGenerateConfigList(t *testing.T) {
 	}
 
 	t.Logf("Read CNI env:\n%vCA", readEnv)
+}
+
+// TestYamlcGeneration 测试 yamlc 库生成的 YAML 是否正确
+func TestYamlcGeneration(t *testing.T) {
+	// 创建测试用的 CniEnv 结构体
+	testCniEnv := &CniEnv{
+		NetWork: "10.96.0.0/12",
+		Subnet:  "10.244.0.0/16",
+		IPv6Net: "fd00::/108",
+		IPv6Sub: "fd00:244::/64",
+		MTU:     1500,
+		IPMasq:  true,
+		Metadata: &Metadata{
+			GeneratedAt: "2025-01-28T10:00:00Z",
+			NodeName:    "test-node",
+			ClusterCIDR: "10.244.0.0/16",
+			ServiceCIDR: "10.96.0.0/12",
+		},
+		Routes: []Route{
+			{
+				Dst: "10.96.0.0/12",
+				GW:  "10.244.0.1",
+			},
+			{
+				Dst: "fd00::/108",
+				GW:  "fd00:244::1",
+			},
+		},
+		DNS: &DNS{
+			Nameservers: []string{"10.96.0.10", "8.8.8.8"},
+			Search:      []string{"cluster.local", "svc.cluster.local"},
+			Options:     []string{"ndots:5", "timeout:2"},
+		},
+		Policies: &Policies{
+			AllowHostAccess:     true,
+			AllowServiceAccess:  true,
+			AllowExternalAccess: false,
+		},
+	}
+
+	// 使用 yamlc 生成 YAML
+	yamlData, err := yamlc.Gen(testCniEnv, yamlc.WithStyle(yamlc.StyleInline))
+	if err != nil {
+		t.Fatalf("Failed to generate YAML with yamlc: %v", err)
+	}
+
+	// 输出生成的 YAML 用于查看
+	t.Logf("Generated YAML with yamlc:\n%s", string(yamlData))
+
+	// 验证生成的 YAML 包含必要的字段
+	yamlStr := string(yamlData)
+
+	// 检查基本字段
+	expectedFields := []string{
+		"network: 10.96.0.0/12",
+		"subnet: 10.244.0.0/16",
+		"ipv6_network: fd00::/108",
+		"ipv6_subnet: fd00:244::/64",
+		"mtu: 1500",
+		"ipmasq: true",
+	}
+
+	for _, field := range expectedFields {
+		if !strings.Contains(yamlStr, field) {
+			t.Errorf("Expected YAML to contain: %s", field)
+		}
+	}
+
+	// 检查注释是否正确生成
+	expectedComments := []string{
+		"# IPv4 network configuration (Service CIDR)",
+		"# IPv4 subnet configuration",
+		"# IPv6 network configuration (Service CIDR)",
+		"# IPv6 subnet configuration",
+		"# MTU configuration",
+		"# IP masquerade configuration",
+	}
+
+	for _, comment := range expectedComments {
+		if !strings.Contains(yamlStr, comment) {
+			t.Errorf("Expected YAML to contain comment: %s", comment)
+		}
+	}
+
+	// 检查 metadata 部分
+	if !strings.Contains(yamlStr, "metadata:") {
+		t.Error("Expected YAML to contain metadata section")
+	}
+
+	if !strings.Contains(yamlStr, "generated_at: 2025-01-28T10:00:00Z") {
+		t.Error("Expected YAML to contain generated_at field")
+	}
+
+	// 检查 routes 部分
+	if !strings.Contains(yamlStr, "routes:") {
+		t.Error("Expected YAML to contain routes section")
+	}
+
+	if !strings.Contains(yamlStr, "dst: 10.96.0.0/12") {
+		t.Error("Expected YAML to contain route destination")
+	}
+
+	// 检查 DNS 部分
+	if !strings.Contains(yamlStr, "dns:") {
+		t.Error("Expected YAML to contain DNS section")
+	}
+
+	if !strings.Contains(yamlStr, "nameservers:") {
+		t.Error("Expected YAML to contain DNS nameservers")
+	}
+
+	// 测试不同的注释样式
+	t.Run("StyleInline", func(t *testing.T) {
+		yamlData, err := yamlc.Gen(testCniEnv, yamlc.WithStyle(yamlc.StyleInline))
+		if err != nil {
+			t.Fatalf("Failed to generate YAML with StyleInline: %v", err)
+		}
+
+		yamlStr := string(yamlData)
+		t.Logf("StyleInline YAML:\n%s", yamlStr)
+
+		// 检查内联注释格式
+		if !strings.Contains(yamlStr, "network: 10.96.0.0/12") {
+			t.Error("Expected inline style to contain network field")
+		}
+	})
+
+	t.Run("StyleSmart", func(t *testing.T) {
+		yamlData, err := yamlc.Gen(testCniEnv, yamlc.WithStyle(yamlc.StyleSmart))
+		if err != nil {
+			t.Fatalf("Failed to generate YAML with StyleSmart: %v", err)
+		}
+
+		yamlStr := string(yamlData)
+		t.Logf("StyleSmart YAML:\n%s", yamlStr)
+
+		// 检查智能样式格式
+		if !strings.Contains(yamlStr, "network: 10.96.0.0/12") {
+			t.Error("Expected smart style to contain network field")
+		}
+	})
+
+	t.Run("StyleCompact", func(t *testing.T) {
+		yamlData, err := yamlc.Gen(testCniEnv, yamlc.WithStyle(yamlc.StyleCompact))
+		if err != nil {
+			t.Fatalf("Failed to generate YAML with StyleCompact: %v", err)
+		}
+
+		yamlStr := string(yamlData)
+		t.Logf("StyleCompact YAML:\n%s", yamlStr)
+
+		// 检查紧凑样式格式
+		if !strings.Contains(yamlStr, "network: 10.96.0.0/12") {
+			t.Error("Expected compact style to contain network field")
+		}
+	})
+
+	// 测试写入文件功能
+	t.Run("WriteToFile", func(t *testing.T) {
+		// 创建临时目录
+		tempDir := t.TempDir()
+		tempFile := filepath.Join(tempDir, "test_env.yaml")
+
+		// 创建配置管理器
+		manager := NewCNIConfigManager(tempDir, "test.conflist", tempFile, logging.NewSimpleLogger())
+
+		// 写入文件
+		if err := manager.WriteCniEnv(testCniEnv); err != nil {
+			t.Fatalf("Failed to write CniEnv to file: %v", err)
+		}
+
+		// 读取文件验证内容
+		readEnv, err := manager.ReadCniEnv()
+		if err != nil {
+			t.Fatalf("Failed to read CniEnv from file: %v", err)
+		}
+
+		// 验证读取的数据是否正确
+		if readEnv.NetWork != testCniEnv.NetWork {
+			t.Errorf("Expected Network %s, got %s", testCniEnv.NetWork, readEnv.NetWork)
+		}
+
+		if readEnv.Subnet != testCniEnv.Subnet {
+			t.Errorf("Expected Subnet %s, got %s", testCniEnv.Subnet, readEnv.Subnet)
+		}
+
+		if readEnv.MTU != testCniEnv.MTU {
+			t.Errorf("Expected MTU %d, got %d", testCniEnv.MTU, readEnv.MTU)
+		}
+
+		// 输出文件内容
+		fileContent, err := os.ReadFile(tempFile)
+		if err != nil {
+			t.Fatalf("Failed to read file: %v", err)
+		}
+
+		t.Logf("File content:\n%s", string(fileContent))
+	})
 }

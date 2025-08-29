@@ -1,52 +1,19 @@
 package cni
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/binrclab/headcni/cmd/daemon/config"
 	"github.com/binrclab/headcni/pkg/logging"
+	"github.com/binrclab/yamlc"
 	"gopkg.in/yaml.v3"
 )
-
-// CNI环境配置模板
-const cniEnvTemplate = `# HeadCNI Environment Configuration
-# Generated at: {{.GeneratedAt}}
-# This file replaces the old subnet.env format with a more structured YAML format
-
-{{if .Network}}# IPv4 network configuration ( Service CIDR)
-network: "{{.Network}}"
-{{end}}{{if .Subnet}}# IPv4 subnet configuration
-subnet: "{{.Subnet}}"
-{{end}}{{if .IPv6Net}}# IPv6 network configuration ( Service CIDR)
-ipv6_network: "{{.IPv6Net}}"
-{{end}}{{if .IPv6Sub}}# IPv6 subnet configuration
-ipv6_subnet: "{{.IPv6Sub}}"
-{{end}}{{if .MTU}}# MTU configuration (can be integer or string)
-mtu: {{.MTU}}
-{{end}}{{if .IPMasq}}# IP masquerade configuration (can be boolean or string)
-ipmasq: {{.IPMasq}}
-{{end}}{{if and .DNS .DNS.Nameservers}}# DNS configuration
-dns:
-  nameservers: {{range .DNS.Nameservers}}
-    - {{.}}{{end}}{{if and .DNS.Search .DNS.Search}}  search: {{range .DNS.Search}}
-    - {{.}}{{end}}{{end}}{{if and .DNS.Options .DNS.Options}}  options: {{range .DNS.Options}}
-    - {{.}}{{end}}{{end}}
-{{end}}{{if and .Routes .Routes}}# Routes configuration
-routes: {{range .Routes}}
-  - dst: "{{.Dst}}"{{if .GW}}
-    gw: "{{.GW}}"{{end}}{{end}}
-{{end}}{{if and .Metadata .Metadata.NodeName}}# Metadata
-metadata:
-  generated_at: "{{.Metadata.GeneratedAt}}"{{if .Metadata.NodeName}}  node_name: "{{.Metadata.NodeName}}"{{end}}{{if .Metadata.ClusterCIDR}}  cluster_cidr: "{{.Metadata.ClusterCIDR}}"{{end}}{{if .Metadata.ServiceCIDR}}  service_cidr: "{{.Metadata.ServiceCIDR}}"{{end}}
-{{end}}`
 
 // CNIPlugin 是 CNI 插件配置结构
 type CNIPlugin struct {
@@ -73,40 +40,41 @@ type Delegate struct {
 }
 
 type CniEnv struct {
-	NetWork  string    `json:"network,omitempty"`
-	Subnet   string    `json:"subnet,omitempty"`
-	IPv6Net  string    `json:"ipv6_network,omitempty"`
-	IPv6Sub  string    `json:"ipv6_subnet,omitempty"`
-	MTU      int       `json:"mtu,omitempty"`
-	IPMasq   bool      `json:"ipmasq,omitempty"`
-	Metadata *Metadata `json:"metadata,omitempty"`
-	Routes   []Route   `json:"routes,omitempty"`
-	DNS      *DNS      `json:"dns,omitempty"`
-	Policies *Policies `json:"policies,omitempty"`
+	NetWork  string    `json:"network,omitempty"      yaml:"network"      comment:"IPv4 network configuration (pod CIDR)"`
+	Subnet   string    `json:"subnet,omitempty"       yaml:"subnet"       comment:"IPv4 subnet configuration"`
+	IPv6Net  string    `json:"ipv6_network,omitempty" yaml:"ipv6_network" comment:"IPv6 network configuration (pod CIDR)"`
+	IPv6Sub  string    `json:"ipv6_subnet,omitempty"  yaml:"ipv6_subnet"  comment:"IPv6 subnet configuration"`
+	MTU      int       `json:"mtu,omitempty"          yaml:"mtu"          comment:"MTU configuration"`
+	IPMasq   bool      `json:"ipmasq,omitempty"       yaml:"ipmasq"       comment:"IP masquerade configuration"`
+	Metadata *Metadata `json:"metadata,omitempty"     yaml:"metadata"     comment:"Metadata information"`
+	Routes   []Route   `json:"routes,omitempty"       yaml:"routes"       comment:"Routes configuration"`
+	DNS      *DNS      `json:"dns,omitempty"          yaml:"dns"          comment:"DNS configuration"`
+	Policies *Policies `json:"policies,omitempty"     yaml:"policies"     comment:"Network policies"`
 }
 
 type Metadata struct {
-	GeneratedAt string `json:"generated_at,omitempty"`
-	NodeName    string `json:"node_name,omitempty"`
-	ClusterCIDR string `json:"cluster_cidr,omitempty"`
-	ServiceCIDR string `json:"service_cidr,omitempty"`
+	GeneratedAt string `json:"generated_at,omitempty" yaml:"generated_at" comment:"Generation timestamp"`
+	NodeName    string `json:"node_name,omitempty"    yaml:"node_name"    comment:"Node name"`
+	ClusterCIDR string `json:"cluster_cidr,omitempty" yaml:"cluster_cidr" comment:"Cluster CIDR"`
+	ServiceCIDR string `json:"service_cidr,omitempty" yaml:"service_cidr" comment:"Service CIDR"`
 }
 
 type Route struct {
-	Dst string `json:"dst,omitempty"`
-	GW  string `json:"gw,omitempty"`
+	Dst string `json:"dst,omitempty" yaml:"dst" comment:"Destination CIDR"`
+	GW  string `json:"gw,omitempty"  yaml:"gw"  comment:"Gateway IP"`
 }
 
 type DNS struct {
-	Nameservers []string `json:"nameservers,omitempty"`
-	Search      []string `json:"search,omitempty"`
-	Options     []string `json:"options,omitempty"`
+	Nameservers []string `json:"nameservers,omitempty" yaml:"nameservers" comment:"DNS nameservers"`
+	Search      []string `json:"search,omitempty"      yaml:"search"      comment:"DNS search domains"`
+	Options     []string `json:"options,omitempty"     yaml:"options"     comment:"DNS options"`
 }
 
 type Policies struct {
-	AllowHostAccess     bool `json:"allow_host_access,omitempty"`
-	AllowServiceAccess  bool `json:"allow_service_access,omitempty"`
-	AllowExternalAccess bool `json:"allow_external_access,omitempty"`
+	AllowHostAccess     bool `json:"allow_host_access,omitempty"     yaml:"allow_host_access"     comment:"Allow host access"`
+	AllowServiceAccess  bool `json:"allow_service_access,omitempty"  yaml:"allow_service_access"  comment:"Allow service access"`
+	AllowExternalAccess bool `json:"allow_external_access,omitempty" yaml:"allow_external_access" comment:"Allow external access"`
+	EgressAllowed       bool `json:"egress_allowed,omitempty"        yaml:"egress_allowed"        comment:"Allow egress traffic"`
 }
 
 // CNIConfigManager 是 CNI 配置管理器
@@ -178,6 +146,7 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 			cniEnv.DNS.Nameservers = append(cniEnv.DNS.Nameservers, cfg.DNS.MagicDNS.Nameservers...)
 		}
 	}
+	cniEnv.Policies = &Policies{}
 	// 处理 ServiceCIDR 和 LocalCIDR，支持 IPv4 和 IPv6
 	var serviceCIDRs []string
 	var localCIDRs []string
@@ -190,16 +159,8 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 	}
 
 	cniEnv.MTU = cfg.Network.MTU
-	cniEnv.NetWork = cfg.Network.ServiceCIDR
+	cniEnv.NetWork = cfg.Network.PodCIDR.Base
 	cniEnv.Subnet = localCIDR
-
-	// 设置 IPv4 和 IPv6 网络信息
-	if len(serviceCIDRs) > 0 {
-		cniEnv.NetWork = serviceCIDRs[0]
-		if len(serviceCIDRs) > 1 {
-			cniEnv.IPv6Net = serviceCIDRs[1]
-		}
-	}
 
 	if len(localCIDRs) > 0 {
 		cniEnv.Subnet = localCIDRs[0]
@@ -214,7 +175,7 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 	cniEnv.Metadata = &Metadata{
 		GeneratedAt: time.Now().Format(time.RFC3339),
 		NodeName:    os.Getenv("NODE_NAME"), // 使用默认节点名
-		ClusterCIDR: localCIDR,
+		ClusterCIDR: cfg.Network.PodCIDR.Base,
 		ServiceCIDR: cfg.Network.ServiceCIDR,
 	}
 
@@ -295,7 +256,6 @@ func (cm *CNIConfigManager) GenerateConfigList(localCIDR string, cfg *config.Con
 
 	// 创建完整的配置列表
 	configList := &CNIPlugin{
-		Type:       "headcni",
 		CNIVersion: "1.0.0",
 		Name:       "cbr0",
 		Plugins:    cniPlugins,
@@ -332,48 +292,25 @@ func (cm *CNIConfigManager) WriteConfigList(configList *CNIPlugin) error {
 	return nil
 }
 
-// WriteCniEnv 写入 cniEnv 配置（使用模板）
+// WriteCniEnv 写入 cniEnv 配置（使用 yamlc 库）
 func (cm *CNIConfigManager) WriteCniEnv(cniEnv *CniEnv) error {
 	// 确保配置目录存在
 	if err := os.MkdirAll(filepath.Dir(cm.cniEnvFile), 0755); err != nil {
 		return fmt.Errorf("failed to create config directory: %v", err)
 	}
 
-	// 不再需要序列化，直接使用模板生成
-
-	// 解析模板
-	tmpl, err := template.New("cniEnv").Parse(cniEnvTemplate)
+	// 使用 yamlc 库生成 YAML 文件，使用 StyleInline 样式以获得更好的格式
+	yamlData, err := yamlc.Gen(cniEnv, yamlc.WithStyle(yamlc.StyleInline))
 	if err != nil {
-		return fmt.Errorf("failed to parse template: %v", err)
-	}
-
-	// 准备模板数据，确保所有字段都有默认值
-	templateData := map[string]interface{}{
-		"GeneratedAt": time.Now().Format(time.RFC3339),
-		"Network":     getStringOrDefault(cniEnv.NetWork, ""),
-		"Subnet":      getStringOrDefault(cniEnv.Subnet, ""),
-		"MTU":         getIntOrDefault(cniEnv.MTU, 1500),
-		"IPMasq":      getBoolOrDefault(cniEnv.IPMasq, false),
-		"IPv6Net":     getStringOrDefault(cniEnv.IPv6Net, ""),
-		"IPv6Sub":     getStringOrDefault(cniEnv.IPv6Sub, ""),
-		"Metadata":    getMetadataOrDefault(cniEnv.Metadata),
-		"DNS":         getDNSOrDefault(cniEnv.DNS),
-		"Routes":      getRoutesOrDefault(cniEnv.Routes),
-	}
-
-	// 执行模板
-	var buf bytes.Buffer
-	err = tmpl.Execute(&buf, templateData)
-	if err != nil {
-		return fmt.Errorf("failed to execute template: %v", err)
+		return fmt.Errorf("failed to generate YAML with yamlc: %v", err)
 	}
 
 	// 写入配置文件
-	if err := os.WriteFile(cm.cniEnvFile, buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(cm.cniEnvFile, yamlData, 0644); err != nil {
 		return fmt.Errorf("failed to write cniEnv file: %v", err)
 	}
 
-	logging.Infof("Successfully wrote CNI env with template: %s", cm.cniEnvFile)
+	logging.Infof("Successfully wrote CNI env with yamlc: %s", cm.cniEnvFile)
 	return nil
 }
 
@@ -478,20 +415,6 @@ func (cm *CNIConfigManager) backupExistingConfigs() error {
 		".yml",      // YAML 格式配置文件（短后缀）
 	}
 
-	// 定义需要备份的文件名前缀模式
-	backupPrefixes := []string{
-		"10-", // 标准 CNI 配置前缀
-		"20-", // 标准 CNI 配置前缀
-		"30-", // 标准 CNI 配置前缀
-		"40-", // 标准 CNI 配置前缀
-		"50-", // 标准 CNI 配置前缀
-		"60-", // 标准 CNI 配置前缀
-		"70-", // 标准 CNI 配置前缀
-		"80-", // 标准 CNI 配置前缀
-		"90-", // 标准 CNI 配置前缀
-		"99-", // 标准 CNI 配置前缀
-	}
-
 	// 遍历 configDir 下的所有文件
 	files, err := os.ReadDir(cm.configDir)
 	if err != nil {
@@ -512,28 +435,6 @@ func (cm *CNIConfigManager) backupExistingConfigs() error {
 			if strings.HasSuffix(fileName, ext) {
 				shouldBackup = true
 				break
-			}
-		}
-
-		// 检查文件前缀是否需要备份
-		if !shouldBackup {
-			for _, prefix := range backupPrefixes {
-				if strings.HasPrefix(fileName, prefix) {
-					shouldBackup = true
-					break
-				}
-			}
-		}
-
-		// 检查是否包含 CNI 相关关键词
-		if !shouldBackup {
-			cniKeywords := []string{"cni", "network", "bridge", "flannel", "calico", "weave", "canal"}
-			lowerFileName := strings.ToLower(fileName)
-			for _, keyword := range cniKeywords {
-				if strings.Contains(lowerFileName, keyword) {
-					shouldBackup = true
-					break
-				}
 			}
 		}
 
@@ -725,61 +626,4 @@ func (cm *CNIConfigManager) GetConfigPath() string {
 // GetBackupDir 获取备份目录路径
 func (cm *CNIConfigManager) GetBackupDir() string {
 	return cm.backupDir
-}
-
-// 移除深拷贝函数，直接覆盖更简单
-
-// 移除复杂的增量更新函数，直接覆盖更简单
-
-// 辅助函数：安全获取字符串值，空值时返回空字符串（模板中不显示）
-func getStringOrDefault(value, defaultValue string) string {
-	if value == "" {
-		return ""
-	}
-	return value
-}
-
-// 辅助函数：安全获取整数值，0值时返回0（模板中不显示）
-func getIntOrDefault(value, defaultValue int) int {
-	if value == 0 {
-		return 0
-	}
-	return value
-}
-
-// 辅助函数：安全获取布尔值，false值时返回false（模板中不显示）
-func getBoolOrDefault(value, defaultValue bool) bool {
-	return value
-}
-
-// 辅助函数：安全获取Metadata，nil时返回nil（模板中不显示）
-func getMetadataOrDefault(metadata *Metadata) *Metadata {
-	if metadata == nil {
-		return nil
-	}
-	// 如果metadata存在但字段为空，也返回nil
-	if metadata.NodeName == "" && metadata.ClusterCIDR == "" && metadata.ServiceCIDR == "" {
-		return nil
-	}
-	return metadata
-}
-
-// 辅助函数：安全获取DNS配置，nil时返回nil（模板中不显示）
-func getDNSOrDefault(dns *DNS) *DNS {
-	if dns == nil {
-		return nil
-	}
-	// 如果DNS存在但所有字段都为空，也返回nil
-	if len(dns.Nameservers) == 0 && len(dns.Search) == 0 && len(dns.Options) == 0 {
-		return nil
-	}
-	return dns
-}
-
-// 辅助函数：安全获取路由配置，nil或空时返回nil（模板中不显示）
-func getRoutesOrDefault(routes []Route) []Route {
-	if routes == nil || len(routes) == 0 {
-		return nil
-	}
-	return routes
 }

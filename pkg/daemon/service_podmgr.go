@@ -521,7 +521,9 @@ func (s *PodMonitoringService) updateCNIConfiguration(podCIDR string) error {
 
 	if len(localCIDR) > 0 {
 		cniEnv.Subnet = localCIDR[0]
-		cniEnv.IPv6Sub = localCIDR[1]
+		if len(localCIDR) > 1 {
+			cniEnv.IPv6Sub = localCIDR[1]
+		}
 	}
 
 	// 使用 UpdateConfigList 进行局部更新

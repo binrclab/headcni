@@ -5,7 +5,7 @@ go 1.24.4
 toolchain go1.24.6
 
 require (
-	github.com/containernetworking/cni v1.3.0
+	github.com/binrclab/yamlc v0.0.0-20250828075026-fd528e911416
 	github.com/containernetworking/plugins v1.7.1
 	github.com/google/wire v0.6.0
 	github.com/hashicorp/go-retryablehttp v0.7.8

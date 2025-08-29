@@ -15,12 +15,12 @@ IMAGE_TAG="${IMAGE_TAG:-latest}"
 PLATFORMS=(
     "linux/amd64"      # 最快 (x86_64)
     "linux/arm64"      # 较快 (ARM64)
-    "linux/386"        # 较快 (x86)
-    "linux/arm/v7"     # 中等 (ARMv7)
-    "linux/arm/v8"     # 中等 (ARMv8)
-    "linux/ppc64le"    # 较慢 (PowerPC)
-    "linux/s390x"      # 较慢 (IBM S390x)
-    "linux/riscv64"    # 最慢 (RISC-V)
+    # "linux/386"        # 较快 (x86)
+    # "linux/arm/v7"     # 中等 (ARMv7)
+    # "linux/arm/v8"     # 中等 (ARMv8)
+    # "linux/ppc64le"    # 较慢 (PowerPC)
+    # "linux/s390x"      # 较慢 (IBM S390x)
+    # "linux/riscv64"    # 最慢 (RISC-V)
     # "darwin/amd64"     # 较快 (macOS Intel)
     # "darwin/arm64"     # 较快 (macOS Apple Silicon)
     # "windows/amd64"    # 中等 (Windows x64)
@@ -196,15 +196,47 @@ build_platforms_parallel() {
     log_info "等待所有构建作业完成..."
     
     # 显示进度
+    local total=${#PLATFORMS[@]}
+    
+    # 等待所有后台作业完成，显示进度
+    log_info "等待所有构建作业完成..."
+    
+    # 使用文件计数来跟踪进度
+    local result_file="$temp_dir/build_results.txt"
     local completed=0
     local total=${#PLATFORMS[@]}
     
     while [ $completed -lt $total ]; do
+        # 计算已完成的作业数（通过结果文件）
+        if [ -f "$result_file" ]; then
+            completed=$(wc -l < "$result_file" 2>/dev/null || echo 0)
+        else
+            completed=0
+        fi
+        
+        # 计算正在运行的作业数
         local running=$(jobs -r | wc -l)
-        local completed=$((total - running))
+        
+        # 显示进度
         log_info "构建进度: $completed/$total 完成, $running 运行中..."
-        sleep 5
+        
+        # 如果所有作业都完成了，退出循环
+        if [ $completed -eq $total ]; then
+            break
+        fi
+        
+        # 等待一段时间再检查
+        sleep 10
     done
+    
+    # 最终状态检查
+    local final_running=$(jobs -r | wc -l)
+    if [ $final_running -eq 0 ]; then
+        log_info "✓ 所有构建作业已完成"
+    else
+        log_warn "⚠ 仍有 $final_running 个作业在运行，等待完成..."
+        wait
+    fi
     
     wait
     
@@ -421,6 +453,7 @@ main() {
             check_dependencies
             setup_local_builder
             build_platforms_parallel
+            export_images_from_cache
             create_manifest
             verify_images
             cleanup
